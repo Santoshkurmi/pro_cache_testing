@@ -1,0 +1,795 @@
+import { createSignal, type Accessor, type Setter } from 'solid-js';
+import { CacheManager } from './cache';
+import { IndexedDBCache } from './db';
+
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error' | 'offline';
+
+export type WSMessage = 
+    | { type: 'ws-invalidate', key: string }
+    | { type: 'ws-status', status: ConnectionStatus }
+    | { type: 'leader-claim', tabId: string }
+    | { type: 'leader-query' }
+    | { type: 'leader-stepdown', oldLeaderId: string }
+    | { type: 'ws-upstream', payload: any }
+    | { type: 'ws-custom', payload: any }
+    | { type: 'network-offline' }
+    | { type: 'network-online' };
+
+export interface WebSocketConfig {
+    url: string | (() => string);
+    channelName?: string;
+    routeToCacheKey?: (routePath: string) => string;
+    defaultBackgroundDelay?: number; // Configurable default
+    backgroundPollInterval?: number; // Configurable poll interval
+}
+
+export class WebSocketClient {
+    // Signals
+    public wsStatus: Accessor<ConnectionStatus>;
+    public setWsStatus: Setter<ConnectionStatus>;
+    public recentActivity: Accessor<boolean>;
+    public setRecentActivity: Setter<boolean>;
+    public isLeaderTab: Accessor<boolean>;
+    public setIsLeaderTab: Setter<boolean>;
+    public isOnline: Accessor<boolean>;
+    public setIsOnline: Setter<boolean>;
+    public isCacheEnabled: Accessor<boolean>;
+    public setIsCacheEnabled: Setter<boolean>;
+
+    private ws: WebSocket | null = null;
+    private reconnectAttempts = 0;
+    private reconnectTimeout: number | null = null;
+    private isExplicitlyClosed = false;
+    private callbacks: Map<string, ((key: string) => void)[]> = new Map();
+    private globalInvalidationCallbacks: (() => void)[] = [];
+    private customListeners: Map<string, ((payload: any) => void)[]> = new Map();
+    
+    // Per-route delay configuration
+    private routeDelays: Map<string, number> = new Map();
+    
+    // Dependencies
+    private cacheManager: CacheManager;
+    private db: IndexedDBCache;
+    private config: WebSocketConfig;
+    
+    // Defaults
+    private readonly DEFAULT_DELAY = 500;
+    private readonly DEFAULT_POLL_INTERVAL = 200;
+
+    // Leader election
+    private tabId: string = Math.random().toString(36).substring(7);
+    private isLeader = false;
+    private channel: BroadcastChannel | null = null;
+    private leaderCheckInterval: number | null = null;
+    private pendingLeaderCheck = false;
+    private leaderCheckResolve: (() => void) | null = null;
+    
+    // Follower heartbeat tracking
+    private lastLeaderHeartbeat: number = 0;
+    private followerCheckInterval: number | null = null;
+    private readonly LEADER_TIMEOUT = 5000; // 5 seconds without heartbeat = leader gone (User Requested)
+    
+    // localStorage keys for instant leader detection
+    private readonly LEADER_KEY = 'ws-leader-tab';
+    private readonly LEADER_HEARTBEAT_KEY = 'ws-leader-heartbeat';
+
+    constructor(cacheManager: CacheManager, db: IndexedDBCache, config: WebSocketConfig) {
+        this.cacheManager = cacheManager;
+        this.db = db;
+        this.config = config;
+
+        // Initialize signals
+        const [wsStatus, setWsStatus] = createSignal<ConnectionStatus>('disconnected');
+        const [recentActivity, setRecentActivity] = createSignal(false);
+        const [isLeaderTab, setIsLeaderTab] = createSignal(false);
+        const [isOnline, setIsOnline] = createSignal(typeof navigator !== 'undefined' ? navigator.onLine : true);
+        const [isCacheEnabled, setIsCacheEnabled] = createSignal(true);
+
+        this.wsStatus = wsStatus;
+        this.setWsStatus = setWsStatus;
+        this.recentActivity = recentActivity;
+        this.setRecentActivity = setRecentActivity;
+        this.isLeaderTab = isLeaderTab;
+        this.setIsLeaderTab = setIsLeaderTab;
+        this.isOnline = isOnline;
+        this.setIsOnline = setIsOnline;
+        this.isCacheEnabled = isCacheEnabled;
+        this.setIsCacheEnabled = setIsCacheEnabled;
+
+        if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+            this.channel = new BroadcastChannel(config.channelName || 'pro-cache-ws-sync');
+            this.channel.onmessage = (event: MessageEvent<WSMessage>) => {
+                this.handleBroadcast(event.data);
+            };
+        }
+        
+        // Network status detection
+        if (typeof window !== 'undefined') {
+            window.addEventListener('online', () => this.handleNetworkOnline());
+            window.addEventListener('offline', () => this.handleNetworkOffline());
+            
+            // Clear localStorage when leader tab closes/refreshes
+            window.addEventListener('beforeunload', () => {
+                if (this.isLeader) {
+                    // Notify followers immediately to start election
+                    this.channel?.postMessage({ type: 'leader-stepdown', oldLeaderId: this.tabId } as WSMessage);
+                    this.clearLeaderStorage();
+                }
+            });
+        }
+    }
+    
+    // Public API to start connection logic
+    public async connect() {
+        await this.becomeLeader();
+    }
+
+    public disconnect() {
+        this.isExplicitlyClosed = true;
+        this.stepDown();
+    }
+    
+    /**
+     * Send data to the WebSocket.
+     * If this tab is the Leader, it sends it directly.
+     * If this tab is a Follower, it forwards it to the Leader via BroadcastChannel.
+     */
+    public send(data: any) {
+        const payload = typeof data === 'string' ? data : JSON.stringify(data);
+        
+        if (this.isLeader) {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.ws.send(payload);
+            } else {
+                console.warn('[WS] Cannot send message, WebSocket not connected');
+            }
+        } else {
+            console.log('[WS] Forwarding message to Leader');
+            this.channel?.postMessage({ type: 'ws-upstream', payload: tryParse(payload) } as WSMessage);
+        }
+    }
+    
+    /**
+     * Listen for custom server messages (based on 'type' field in JSON)
+     */
+    public on(type: string, callback: (payload: any) => void): () => void {
+        if (!this.customListeners.has(type)) {
+            this.customListeners.set(type, []);
+        }
+        this.customListeners.get(type)!.push(callback);
+        
+        return () => {
+             const listeners = this.customListeners.get(type);
+             if (listeners) {
+                 const idx = listeners.indexOf(callback);
+                 if (idx > -1) listeners.splice(idx, 1);
+             }
+        };
+    }
+    
+    public off(type: string, callback: (payload: any) => void) {
+        const listeners = this.customListeners.get(type);
+        if (listeners) {
+            const idx = listeners.indexOf(callback);
+            if (idx > -1) listeners.splice(idx, 1);
+        }
+    }
+
+    private startFollowerHeartbeatCheck() {
+        // Stop any existing interval
+        if (this.followerCheckInterval) {
+            clearInterval(this.followerCheckInterval);
+        }
+        
+        // Check every 2 seconds (faster check due to 5s timeout)
+        this.followerCheckInterval = window.setInterval(() => {
+            if (this.isLeader) {
+                // We're the leader now, stop checking
+                this.stopFollowerHeartbeatCheck();
+                return;
+            }
+            
+            // Request status from leader (leader will respond with ws-status)
+            this.channel?.postMessage({ type: 'leader-query' } as WSMessage);
+            
+            const timeSinceLastHeartbeat = Date.now() - this.lastLeaderHeartbeat;
+            if (timeSinceLastHeartbeat > this.LEADER_TIMEOUT) {
+                console.log(`[WS Follower] Leader timeout (${timeSinceLastHeartbeat}ms), attempting to become leader`);
+                this.stopFollowerHeartbeatCheck();
+                this.becomeLeader();
+            }
+        }, 2000);
+    }
+    
+    private stopFollowerHeartbeatCheck() {
+        if (this.followerCheckInterval) {
+            clearInterval(this.followerCheckInterval);
+            this.followerCheckInterval = null;
+        }
+    }
+    
+    private handleNetworkOffline() {
+        console.log('[Network] Browser went OFFLINE');
+        this.setIsOnline(false);
+        this.setWsStatus('offline');
+        
+        // Note: Cache is NOT cleared - just disabled via isCacheEnabled
+        
+        // Broadcast to other tabs
+        this.channel?.postMessage({ type: 'network-offline' } as WSMessage);
+        this.broadcastStatus('offline');
+        
+        // Disconnect WebSocket
+        if (this.isLeader && this.ws) {
+            this.disconnectWebSocket();
+        }
+    }
+    
+    private handleNetworkOnline() {
+        console.log('[Network] Browser went ONLINE');
+        this.setIsOnline(true);
+        
+        // Broadcast to other tabs
+        this.channel?.postMessage({ type: 'network-online' } as WSMessage);
+        
+        // Reconnect WebSocket if leader
+        if (this.isLeader) {
+            this.reconnectAttempts = 0; // Reset attempts
+            this.connectWebSocket();
+        }
+        
+        // Trigger global invalidation callbacks to refetch data
+        this.globalInvalidationCallbacks.forEach(cb => cb());
+    }
+
+    private async pollForCache(key: string, callbacks: ((k:string)=>void)[]) {
+        const maxWait = this.getDelay(key);
+        const pollInterval = this.config.backgroundPollInterval ?? this.DEFAULT_POLL_INTERVAL;
+        const startTime = Date.now();
+
+        console.log(`[WS] Background polling started for ${key} (Max: ${maxWait}ms, Interval: ${pollInterval}ms)`);
+
+        const check = async () => {
+            // Check if cache populated (by other tab via BroadcastChannel or IDB)
+            const data = await this.cacheManager.get(key);
+            
+            if (data) {
+                console.log(`[WS] Background polling success! Cache populated for ${key}`);
+                callbacks.forEach(cb => cb(key));
+                return;
+            }
+
+            if (Date.now() - startTime >= maxWait) {
+                console.log(`[WS] Background polling timed out (${maxWait}ms), forcing fetch for ${key}`);
+                callbacks.forEach(cb => cb(key));
+                return;
+            }
+
+            // Retry after interval
+            setTimeout(check, pollInterval);
+        };
+        
+        // Initial wait to give active tab a head start
+        setTimeout(check, pollInterval);
+    }
+
+    private handleBroadcast(msg: WSMessage) {
+        if (msg.type === 'ws-invalidate') {
+            // Non-leader tabs receive invalidation from leader
+            // DON'T invalidate cache here - leader already cached fresh data
+            // Just trigger callbacks to refetch (will hit cache)
+            if (!this.isLeader) {
+                console.log(`[WS Follower] Data update from leader: ${msg.key}`);
+                
+                // Trigger activity animation
+                this.setRecentActivity(true);
+                setTimeout(() => this.setRecentActivity(false), 2500);
+                
+                // Trigger callbacks - they will refetch and get cache hit
+                const callbacks = this.callbacks.get(msg.key) || [];
+                
+                const isFocused = typeof document !== 'undefined' && document.hasFocus();
+                
+                if (isFocused) {
+                    // We are active - Refetch immediately
+                    console.log(`[WS Follower] Active tab - triggering refetch immediately`);
+                    callbacks.forEach(cb => cb(msg.key));
+                } else {
+                    // We are background - Poll for cache update from active tab
+                    this.pollForCache(msg.key, callbacks);
+                }
+            }
+        } else if (msg.type === 'ws-status') {
+            // Sync status from leader
+            if (!this.isLeader) {
+                this.setWsStatus(msg.status);
+            }
+        } else if (msg.type === 'network-offline') {
+            // Leader detected network offline
+            console.log('[WS Follower] Network offline notification from leader');
+            this.setIsOnline(false);
+            this.setWsStatus('offline');
+        } else if (msg.type === 'network-online') {
+            // Leader detected network online
+            console.log('[WS Follower] Network online notification from leader');
+            this.setIsOnline(true);
+            // Trigger global invalidation callbacks to refetch data
+            this.globalInvalidationCallbacks.forEach(cb => cb());
+        } else if (msg.type === 'leader-stepdown') {
+            // Current leader is stepping down specifically (e.g. tab closed)
+            // Instant election trigger
+            if (!this.isLeader && this.lastLeaderHeartbeat > 0) {
+                 console.log(`[WS] Received leader stepdown from ${msg.oldLeaderId}, starting election immediately`);
+                 // Force timeout condition essentially
+                 this.stopFollowerHeartbeatCheck();
+                 this.becomeLeader();
+            }
+        } else if (msg.type === 'leader-claim') {
+            // Another tab claims leadership - update heartbeat
+            if (msg.tabId !== this.tabId) {
+                // Update heartbeat timestamp
+                this.lastLeaderHeartbeat = Date.now();
+                
+                if (this.isLeader) {
+                    console.log(`[WS] Another tab (${msg.tabId}) claimed leadership, stepping down`);
+                    this.stepDown();
+                    // Start monitoring the new leader
+                    this.startFollowerHeartbeatCheck();
+                } else if (this.pendingLeaderCheck) {
+                    // We were checking for leaders - found one!
+                    console.log(`[WS] Tab ${this.tabId} found existing leader (${msg.tabId}), staying as FOLLOWER`);
+                    this.pendingLeaderCheck = false;
+                    this.leaderCheckResolve?.();
+                    // Start monitoring the leader
+                    this.startFollowerHeartbeatCheck();
+                }
+                
+                // Safety check: If we somehow have a WebSocket but aren't leader, close it
+                if (!this.isLeader && this.ws) {
+                    console.log(`[WS] Tab ${this.tabId} has orphan WebSocket, closing it`);
+                    this.disconnectWebSocket();
+                }
+            }
+        } else if (msg.type === 'leader-query') {
+            // A new tab is asking if there's a leader
+            if (this.isLeader) {
+                // Respond with leadership claim (debug level since this is frequent)
+                console.debug(`[WS Leader] Responding to leadership query`);
+                this.channel?.postMessage({ type: 'leader-claim', tabId: this.tabId } as WSMessage);
+                
+                // Ensure WebSocket is connected (might have failed to connect when becoming leader)
+                if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+                    console.log('[WS Leader] WebSocket not connected, attempting to connect...');
+                    this.connectWebSocket();
+                }
+                
+                // Broadcast current WebSocket status so follower knows connection state
+                this.channel?.postMessage({ type: 'ws-status', status: this.wsStatus() } as WSMessage);
+            }
+        } else if (msg.type === 'ws-upstream') {
+            // Leader received message from Follower to send to server
+            if (this.isLeader) {
+                console.log('[WS Leader] Relaying upstream message from follower');
+                this.send(msg.payload);
+            }
+        } else if (msg.type === 'ws-custom') {
+            // Follower received custom message relayed by Leader
+            if (!this.isLeader) {
+                const payload = msg.payload;
+                if (payload && payload.type) {
+                     const listeners = this.customListeners.get(payload.type);
+                     if (listeners) {
+                         listeners.forEach(cb => cb(payload));
+                     }
+                }
+            }
+        }
+    }
+
+    private becomeLeader() {
+        if (this.isLeader) return Promise.resolve();
+        
+        // INSTANT CHECK: Check localStorage for existing leader
+        const storedLeader = localStorage.getItem(this.LEADER_KEY);
+        const storedHeartbeat = localStorage.getItem(this.LEADER_HEARTBEAT_KEY);
+        
+        if (storedLeader && storedHeartbeat) {
+            const heartbeatAge = Date.now() - parseInt(storedHeartbeat, 10);
+            if (heartbeatAge < this.LEADER_TIMEOUT && storedLeader !== this.tabId) {
+                // Leader exists and is recent - become follower immediately
+                console.log(`[WS] Tab ${this.tabId} found existing leader (${storedLeader}) via localStorage - INSTANT follower`);
+                this.lastLeaderHeartbeat = parseInt(storedHeartbeat, 10);
+                this.startFollowerHeartbeatCheck();
+                
+                // Request current status from leader
+                this.channel?.postMessage({ type: 'leader-query' } as WSMessage);
+                
+                return Promise.resolve();
+            }
+        }
+        
+        // No valid leader in localStorage - do quick BroadcastChannel check
+        return new Promise<void>((resolve) => {
+            this.pendingLeaderCheck = true;
+            this.leaderCheckResolve = resolve;
+            
+            // Send query for existing leader
+            console.log(`[WS] Tab ${this.tabId} sending leader query...`);
+            this.channel?.postMessage({ type: 'leader-query' } as WSMessage);
+            
+            // Wait for leader response
+            setTimeout(() => {
+                if (this.pendingLeaderCheck) {
+                    // Double-check localStorage before becoming leader (race condition prevention)
+                    const storedLeader = localStorage.getItem(this.LEADER_KEY);
+                    const storedHeartbeat = localStorage.getItem(this.LEADER_HEARTBEAT_KEY);
+                    
+                    if (storedLeader && storedHeartbeat && storedLeader !== this.tabId) {
+                        const heartbeatAge = Date.now() - parseInt(storedHeartbeat, 10);
+                        if (heartbeatAge < this.LEADER_TIMEOUT) {
+                            // A leader appeared while we were waiting - become follower
+                            console.log(`[WS] Tab ${this.tabId} found leader in localStorage during election, becoming follower`);
+                            this.pendingLeaderCheck = false;
+                            this.lastLeaderHeartbeat = parseInt(storedHeartbeat, 10);
+                            this.startFollowerHeartbeatCheck();
+                            resolve();
+                            return;
+                        }
+                    }
+                    
+                    // No valid leader, become leader
+                    this.pendingLeaderCheck = false;
+                    this.isLeader = true;
+                    this.setIsLeaderTab(true);
+                    console.log(`[WS] Tab ${this.tabId} became LEADER`);
+                    
+                    // Store leadership in localStorage for instant detection
+                    this.updateLeaderStorage();
+                    
+                    // Stop follower heartbeat check since we're leader now
+                    this.stopFollowerHeartbeatCheck();
+                    
+                    // Broadcast leadership claim
+                    this.channel?.postMessage({ type: 'leader-claim', tabId: this.tabId } as WSMessage);
+                    
+                    // Connect WebSocket (only if we're still the leader)
+                    if (this.isLeader) {
+                        this.connectWebSocket();
+                    }
+                    
+                    // Periodic leadership ping and localStorage update
+            this.leaderCheckInterval = window.setInterval(() => {
+                if (this.isLeader) {
+                    this.channel?.postMessage({ type: 'leader-claim', tabId: this.tabId } as WSMessage);
+                    this.updateLeaderStorage();
+                }
+            }, 2000); // 2 seconds ping (faster update)
+                    
+                    resolve();
+                }
+                // If pendingLeaderCheck is false, handleBroadcast already resolved
+            }, 150); // Increased timeout for more reliable BroadcastChannel delivery
+        });
+    }
+    
+    private updateLeaderStorage() {
+        localStorage.setItem(this.LEADER_KEY, this.tabId);
+        localStorage.setItem(this.LEADER_HEARTBEAT_KEY, Date.now().toString());
+    }
+    
+    private clearLeaderStorage() {
+        const storedLeader = localStorage.getItem(this.LEADER_KEY);
+        if (storedLeader === this.tabId) {
+            localStorage.removeItem(this.LEADER_KEY);
+            localStorage.removeItem(this.LEADER_HEARTBEAT_KEY);
+        }
+    }
+
+    private stepDown() {
+        if (!this.isLeader) return;
+        
+        console.log(`[WS] Tab ${this.tabId} stepping down from leadership`);
+        this.isLeader = false;
+        this.setIsLeaderTab(false);
+        
+        // Clear localStorage so new leader can be detected instantly
+        this.clearLeaderStorage();
+        
+        if (this.leaderCheckInterval) {
+            clearInterval(this.leaderCheckInterval);
+            this.leaderCheckInterval = null;
+        }
+        
+        this.disconnectWebSocket();
+    }
+
+    private connectWebSocket() {
+        // Only leader should connect WebSocket
+        if (!this.isLeader) {
+            console.warn(`[WS] Tab ${this.tabId} tried to connect WebSocket but is not leader`);
+            return;
+        }
+        
+        if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
+            console.debug('[WS Leader] WebSocket already connected/connecting, skipping');
+            return;
+        }
+        
+        // Clear any pending reconnect timeout to prevent duplicate connection attempts
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+            this.reconnectTimeout = null;
+        }
+
+        this.isExplicitlyClosed = false;
+        this.setWsStatus('connecting');
+        this.broadcastStatus('connecting');
+
+        const url = typeof this.config.url === 'function' ? this.config.url() : this.config.url;
+
+        console.debug('[WS Leader] Connecting to', url);
+
+        try {
+            this.ws = new WebSocket(url);
+        } catch(e) {
+            console.error('[WS Leader] Failed to create WebSocket', e);
+            this.setWsStatus('error');
+            this.broadcastStatus('error');
+            return;
+        }
+
+        this.ws.onopen = () => {
+            console.debug('[WS Leader] Connected');
+            this.setWsStatus('connected');
+            this.broadcastStatus('connected');
+            this.reconnectAttempts = 0;
+            
+            // Re-enable caching (may have been disabled by previous disconnect)
+            this.setIsCacheEnabled(true);
+        };
+
+        this.ws.onclose = () => {
+
+            this.setWsStatus('disconnected');
+            this.broadcastStatus('disconnected');
+            console.debug('[WS Leader] Disconnected');
+            
+            // Disable caching on disconnect/failure to force API usage
+            // We clear cache because without socket we can't guarantee freshness
+            console.log('[WS Leader] Clearing cache due to disconnect');
+            this.setIsCacheEnabled(false);
+            this.cacheManager.clear();
+            
+            if (!this.isExplicitlyClosed && this.isLeader) {
+                this.scheduleReconnect();
+            }
+        };
+
+        this.ws.onerror = (err) => {
+            console.error('[WS Leader] Error', err);
+            this.setWsStatus('error');
+            this.broadcastStatus('error');
+            
+            // Disable caching on error to force API usage
+            console.log('[WS Leader] Clearing cache due to error');
+            this.setIsCacheEnabled(false);
+            this.cacheManager.clear();
+        };
+
+        this.ws.onmessage = (event) => {
+            try {
+                // Handle raw string messages (e.g. "users.list")
+                if (typeof event.data === 'string' && !event.data.startsWith('{') && !event.data.startsWith('[')) {
+                    // It's a plain string key
+                    console.debug('[WS Leader] Received raw string message:', event.data);
+                    this.handleMessage({ type: 'invalidate', key: event.data });
+                    return;
+                }
+
+                const msg = JSON.parse(event.data);
+                this.handleMessage(msg);
+            } catch (e) {
+                console.warn('[WS Leader] Failed to parse message', event.data);
+                // Fallback: treat as key if parse fails?
+                // this.handleMessage({ type: 'invalidate', key: event.data });
+            }
+        };
+    }
+
+    private disconnectWebSocket() {
+        if (this.ws) {
+            this.ws.close();
+            this.ws = null;
+        }
+        if (this.reconnectTimeout) {
+            clearTimeout(this.reconnectTimeout);
+        }
+    }
+
+    private broadcastStatus(status: ConnectionStatus) {
+        this.channel?.postMessage({ type: 'ws-status', status } as WSMessage);
+    }
+
+    private scheduleReconnect() {
+        // Don't reconnect if offline
+        if (typeof navigator !== 'undefined' && !navigator.onLine) {
+            console.log('[WS Leader] Network offline, skipping reconnect');
+            return;
+        }
+
+        // Progressive delay
+        const delayTier = Math.floor(this.reconnectAttempts / 4);
+        const delay = Math.min(5000 + (delayTier * 5000), 20000);
+        
+        this.reconnectAttempts++;
+        console.debug(`[WS Leader] Reconnecting in ${delay / 1000}s (Attempt ${this.reconnectAttempts})`);
+
+        this.reconnectTimeout = window.setTimeout(() => {
+            if (this.isLeader && navigator.onLine) {
+                this.connectWebSocket();
+            }
+        }, delay);
+    }
+
+    private async handleMessage(msg: any) {
+        // Default route mapper if not provided
+        const routePathToCacheKey = this.config.routeToCacheKey || ((routePath: string) => routePath);
+        
+        // Initial sync message
+        const routeKeys = Object.keys(msg).filter(k => k.startsWith('/'));
+        if (routeKeys.length > 1) {
+            console.log('[WS Leader] Received timestamp sync from server');
+            
+            const localTimestamps = await this.db.getAllTimestamps();
+            
+            let newerCount = 0;
+            let totalCount = 0;
+            
+            for (const [route, serverTimestamp] of Object.entries(msg)) {
+                if (!route.startsWith('/')) continue;
+                totalCount++;
+                
+                const localTimestamp = localTimestamps[route];
+                const serverTs = serverTimestamp as number;
+                
+                if (!localTimestamp || serverTs > localTimestamp) {
+                    newerCount++;
+                }
+            }
+            
+            if (totalCount > 0 && newerCount === totalCount && Object.keys(localTimestamps).length > 0) {
+                console.log('[WS Leader] Server restart detected - all routes have newer timestamps');
+                this.cacheManager.clear();
+                await this.db.clearAll();
+                
+                this.globalInvalidationCallbacks.forEach(cb => cb());
+            } else {
+                for (const [route, serverTimestamp] of Object.entries(msg)) {
+                    if (!route.startsWith('/')) continue;
+                    
+                    const localTimestamp = localTimestamps[route];
+                    const serverTs = serverTimestamp as number;
+                    
+                    if (!localTimestamp || serverTs > localTimestamp) {
+                        console.log(`[WS Leader] Route ${route} is stale (local: ${localTimestamp}, server: ${serverTs})`);
+                        
+                        const cacheKey = routePathToCacheKey(route);
+                        this.cacheManager.invalidate(cacheKey);
+                        
+                        const callbacks = this.callbacks.get(cacheKey) || [];
+                        callbacks.forEach(cb => cb(cacheKey));
+                    }
+                }
+            }
+            
+            await this.db.setTimestamps(msg);
+            this.setIsCacheEnabled(true);
+            
+            this.setRecentActivity(true);
+            setTimeout(() => this.setRecentActivity(false), 2500);
+            
+            return;
+        }
+        
+        // Delta update message
+        const routes = Object.keys(msg);
+        if (routes.length > 0 && routes[0].startsWith('/')) {
+            const routePath = routes[0];
+            const timestamp = msg[routePath];
+            
+            console.log(`[WS Leader] Route update: ${routePath} at ${timestamp}`);
+            
+            const cacheKey = routePathToCacheKey(routePath);
+            console.log(`[WS Leader] Invalidating cache for ${cacheKey}`);
+            this.cacheManager.invalidate(cacheKey);
+            
+            await this.db.setTimestamp(routePath, timestamp);
+            
+            this.setRecentActivity(true);
+            setTimeout(() => this.setRecentActivity(false), 2500);
+            
+            // Smart Refetch Logic:
+            // 1. Broadcast immediately so active followers can update ASAP
+            // 2. Only fetch locally immediately if we are the active tab
+            // 3. If background, wait to see if active tab updates cache first
+
+            // Broadcast to followers IMMEDIATELY
+            console.log(`[WS Leader] Broadcasting update to followers: ${cacheKey}`);
+            this.channel?.postMessage({ type: 'ws-invalidate', key: cacheKey } as WSMessage);
+
+            const callbacks = this.callbacks.get(cacheKey) || [];
+            
+            // Check if we are the focused tab
+            const isFocused = typeof document !== 'undefined' && document.hasFocus();
+
+            if (isFocused) {
+                // We are active - Refetch immediately
+                console.log(`[WS Leader] Active tab - triggering ${callbacks.length} callbacks immediately`);
+                callbacks.forEach(cb => cb(cacheKey));
+            } else {
+                // We are background - Wait for active tab (follower) to potentially fetch and sync cache
+                // Poll for cache update from active tab
+                this.pollForCache(cacheKey, callbacks);
+            }
+            
+            return;
+        }
+        
+        // Check for custom message types
+        if (msg.type) {
+             const listeners = this.customListeners.get(msg.type);
+             if (listeners) {
+                 console.log(`[WS Leader] Dispatching custom message: ${msg.type}`);
+                 listeners.forEach(cb => cb(msg));
+             }
+             
+             // Broadcast custom message to followers
+             this.channel?.postMessage({ type: 'ws-custom', payload: msg } as WSMessage);
+        }
+    }
+
+    public onInvalidate(key: string, callback: (key: string) => void): () => void {
+        if (!this.callbacks.has(key)) {
+            this.callbacks.set(key, []);
+        }
+        this.callbacks.get(key)!.push(callback);
+
+        return () => {
+            const cbs = this.callbacks.get(key);
+            if (cbs) {
+                const index = cbs.indexOf(callback);
+                if (index > -1) {
+                    cbs.splice(index, 1);
+                }
+            }
+        };
+    }
+    
+    public onGlobalInvalidate(callback: () => void): () => void {
+        this.globalInvalidationCallbacks.push(callback);
+        
+        return () => {
+            const index = this.globalInvalidationCallbacks.indexOf(callback);
+            if (index > -1) {
+                this.globalInvalidationCallbacks.splice(index, 1);
+            }
+        };
+    }
+    
+    public setRouteDelay(key: string, delay: number) {
+        this.routeDelays.set(key, delay);
+    }
+    
+    private getDelay(key: string): number {
+        return this.routeDelays.get(key) ?? this.config.defaultBackgroundDelay ?? this.DEFAULT_DELAY;
+    }
+}
+
+// Helper to safely parse potentially stringified JSON in upstream messages
+function tryParse(str: string): any {
+    try {
+        return JSON.parse(str);
+    } catch {
+        return str;
+    }
+}
