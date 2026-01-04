@@ -111,6 +111,6 @@ app.delete('/api/todos/:id', async (req, res) => {
     res.json({ success: true });
 });
 
-app.listen(PORT, () => {
-    console.log(`Dummy Backend running on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Dummy Backend running on http://0.0.0.0:${PORT}`);
 });

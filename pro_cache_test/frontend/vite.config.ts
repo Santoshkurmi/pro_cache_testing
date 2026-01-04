@@ -10,4 +10,7 @@ export default defineConfig({
       'pro_cache': resolve(__dirname, '../../pro_cache/src/index.ts'),
     },
   },
+  server: {
+    host: '0.0.0.0',
+  },
 })

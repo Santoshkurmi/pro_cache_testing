@@ -19,6 +19,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(move || {
         App::new()
             .app_data(state.clone())
+            .wrap(actix_cors::Cors::permissive())
             .wrap(middleware::Logger::default())
             // Public WebSocket Endpoint
             .route("/ws", web::get().to(ws::ws_handler))

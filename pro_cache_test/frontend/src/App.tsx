@@ -6,7 +6,7 @@ import { createProCache, useLiveFetch, ProCacheClient } from 'pro_cache';
 // Use a mutable variable for token to allow dynamic updates via function-based URL
 let currentToken = '';
 
-const apiBase = 'http://localhost:3001/api';
+const apiBase = `http://${window.location.hostname}:3001/api`;
 
 const cache = createProCache({ 
     debug: true,
@@ -32,8 +32,8 @@ const cache = createProCache({
     }
 });
 
-const API_URL = 'http://localhost:3001/api';
-const WS_URL = 'ws://127.0.0.1:8080/ws';
+const API_URL = `http://${window.location.hostname}:3001/api`;
+const WS_URL = `ws://${window.location.hostname}:8080/ws`;
 
 function App() {
   const [userId, setUserId] = useState(localStorage.getItem('userId'));
