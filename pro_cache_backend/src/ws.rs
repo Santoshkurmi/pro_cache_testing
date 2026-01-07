@@ -48,37 +48,16 @@ pub async fn ws_handler(
     let user_id = token_data.user_id.clone();
     let session_id = Uuid::new_v4();
 
-    // 4. Send Initial Invalidation State
-    // Logic: Send ALL known routes. 
-    // Timestamp = max(project_specific_invalidation, server_start_time)
+    // 5. Send Initial Invalidation State
+    // User Requirement: "if server restarted send to array 'all' string to know to clear all"
     
-    let mut initial_sync = std::collections::HashMap::new();
-    let server_start = data.server_start_time;
-
-    // 1. Start with all known routes at server_start_time
-    for r in data.known_routes.iter() {
-        initial_sync.insert(r.key().clone(), server_start);
-    }
-
-    // 2. Overlay specific project invalidations if they exist
-    if let Some(project_state) = data.project_invalidation_state.get(&project_id) {
-         for entry in project_state.iter() {
-             // Only update if newer (though logic dictates invalidation is always newer than start)
-             // But strictly speaking we just want the latest known state
-             initial_sync.insert(entry.key().clone(), *entry.value());
-         }
-    }
-
-    if !initial_sync.is_empty() {
-         let sync_msg = serde_json::to_string(&initial_sync).unwrap_or_default();
-         let _ = session.text(sync_msg).await;
-    } else {
-        // Fallback: If no routes known at all, send "all" signal
-        let all_sync = serde_json::json!({
-            "all": server_start
-        });
-        let _ = session.text(all_sync.to_string()).await;
-    }
+    let all_sync = serde_json::json!({
+        "type": "invalidate",
+        "data": {
+            "all": data.server_start_time
+        }
+    });
+    let _ = session.text(all_sync.to_string()).await;
 
     // 5. Create Channel for this session
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -90,7 +69,7 @@ pub async fn ws_handler(
         .or_insert_with(dashmap::DashMap::new)
         .insert(session_id, SessionData {
             user_id: user_id.clone(),
-            sender: tx,
+            sender: tx
         });
 
     let active_sessions = data.active_sessions.clone();
