@@ -14,6 +14,7 @@ export interface ProCacheConfig {
     debug?: boolean;
     autoRefetchOnInvalidation?: boolean;
     getTimestamp?: (response: AxiosResponse) => number;
+    cacheWritesOffline?: boolean;
 }
 
 export interface RouteDef {
@@ -89,7 +90,8 @@ export class ProCacheClient {
         route: RouteDef | string, 
         params?: Record<string, string | number>, 
         query?: Record<string, string | number>,
-        cacheKeyOverride?: string
+        cacheKeyOverride?: string,
+        force: boolean = false
     ): Promise<T> {
         // Normalize input
         const routeDef: RouteDef = typeof route === 'string' ? { path: route, cache_ttl: this.config.api?.defaultCacheTtl } : route;
@@ -130,7 +132,8 @@ export class ProCacheClient {
         }
 
         // 1. Check Cache (Bucket + Specific Key)
-        if (cachingEnabled && ttl && ttl > 0) {
+        // Skip cache if FORCE is true
+        if (!force && cachingEnabled && ttl && ttl > 0) {
             const cached = await this.cache.get<T>(routePattern, specificKey);
             if (cached) {
                 if (this.config.debug) console.log(`[ProCache] CACHE HIT for "${specificKey}" in bucket "${routePattern}"`);
@@ -154,7 +157,10 @@ export class ProCacheClient {
                 const data = response.data;
 
                 // 4. Set Cache
-                if (cachingEnabled) {
+                // Write if caching is enabled OR if explicit offline writing is configured
+                const shouldCache = cachingEnabled || (this.config.cacheWritesOffline === true && ttl !== undefined && ttl !== null && ttl > 0);
+                
+                if (shouldCache) {
                     if (!this.config.getTimestamp) {
                         throw new Error('[ProCache] Caching is enabled but "getTimestamp" callback is missing in config. You must provide a way to extract the server timestamp from the response to ensure data consistency.');
                     }

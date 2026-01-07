@@ -21,7 +21,7 @@ export const TodoDetail: React.FC<TodoDetailProps> = ({ id, onBack }) => {
         {
             params: { id },
              // Auto-refetch is DISABLED as per request to test manual updates
-            autoRefetch: false,
+            autoRefetch: true,
             // We can also verify cache keys
         }
     );
@@ -32,7 +32,7 @@ export const TodoDetail: React.FC<TodoDetailProps> = ({ id, onBack }) => {
         if (!editTitle) return;
         await axios.put(`${API_URL}/todos/${id}`, { title: editTitle });
         setEditTitle('');
-        refetch(); // Optimistic or manual refetch
+        refetch({ force: true }); // Optimistic or manual refetch with bypass
     };
 
     if (loading) return <div>Loading Detail...</div>;

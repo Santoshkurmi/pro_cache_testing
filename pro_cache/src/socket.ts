@@ -634,10 +634,9 @@ export class WebSocketClient {
             console.debug('[WS Leader] Disconnected');
             
             // Disable caching on disconnect/failure to force API usage
-            // We clear cache because without socket we can't guarantee freshness
-            console.log('[WS Leader] Clearing cache due to disconnect');
+            // We NO LONGER clear cache, so data persists for offline usage or basic persistence
+            console.log('[WS Leader] Disabling cache serving due to disconnect (Persistence Active)');
             this.setIsCacheEnabled(false);
-            this.cacheManager.clear();
             
             if (!this.isExplicitlyClosed && this.isLeader) {
                 this.scheduleReconnect();
@@ -650,9 +649,8 @@ export class WebSocketClient {
             this.broadcastStatus('error');
             
             // Disable caching on error to force API usage
-            console.log('[WS Leader] Clearing cache due to error');
+            console.log('[WS Leader] Disabling cache serving due to error (Persistence Active)');
             this.setIsCacheEnabled(false);
-            this.cacheManager.clear();
         };
 
         this.ws.onmessage = (event) => {

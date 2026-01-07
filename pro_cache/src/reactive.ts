@@ -19,7 +19,7 @@ export interface LiveFetchOptions {
 
 export interface LiveFetchResult<T> {
     data: Resource<T | undefined>;
-    refetch: (info?: unknown) => T | Promise<T | undefined> | undefined | null;
+    refetch: (info?: { force?: boolean }) => T | Promise<T | undefined> | undefined | null;
     isRefetching: Accessor<boolean>;
     isRefetchNeeded: Accessor<boolean>;
 }
@@ -28,7 +28,7 @@ export function createLiveFetch<T>(
     client: ProCacheClient,
     source: Accessor<RouteSource> | RouteSource,
     options?: Accessor<LiveFetchOptions | undefined> | LiveFetchOptions
-): [Resource<T | undefined>, { refetch: (info?: unknown) => any; isRefetching: Accessor<boolean>; isRefetchNeeded: Accessor<boolean> }] {
+): [Resource<T | undefined>, { refetch: (info?: { force?: boolean }) => any; isRefetching: Accessor<boolean>; isRefetchNeeded: Accessor<boolean> }] {
     // 1. Internal Signals
     const [isRefetching, setIsRefetching] = createSignal(false);
     const [isRefetchNeeded, setIsRefetchNeeded] = createSignal(false);
@@ -48,17 +48,24 @@ export function createLiveFetch<T>(
         async ({ source, options }) => {
             // Unpack and fetch
             try {
-                return await client.fetch<T>(source, options?.params, options?.query, options?.cacheKey);
+                // Workaround: We will use a signal/ref "nextRefetchForce" that we read here.
+                const force = nextRefetchForce;
+                nextRefetchForce = false; // consume it
+                return await client.fetch<T>(source, options?.params, options?.query, options?.cacheKey, force);
             } finally {
                setIsRefetching(false);
             }
         }
     );
 
+    // Side-channel for force param
+    let nextRefetchForce = false;
+
     // Wrapped refetch to toggle isRefetching
-    const refetch = (info?: unknown) => {
+    const refetch = (info?: { force?: boolean }) => {
         setIsRefetching(true);
         setIsRefetchNeeded(false); // Reset needed state
+        if (info?.force) nextRefetchForce = true;
         return originalRefetch(info);
     };
 
@@ -90,17 +97,36 @@ export function createLiveFetch<T>(
         const shouldAutoRefetch = o?.autoRefetch ?? client.config.autoRefetchOnInvalidation ?? false;
 
         console.log(`[createLiveFetch] Subscribing to key: ${key}`);
-        cleanupFn = client.socket.onInvalidate(key, () => {
-             console.log(`[createLiveFetch] Invalidation received for key: ${key}`);
-             
-             if (shouldAutoRefetch) {
+        
+        const handleInvalidation = (auto: boolean) => {
+             if (auto) {
                  console.log(`[createLiveFetch] Auto-refetching...`);
                  refetch();
              } else {
                  console.log(`[createLiveFetch] Marked as needed (autoRefetch disabled).`);
                  setIsRefetchNeeded(true);
              }
+        };
+
+        const unsub1 = client.socket.onInvalidate(key, () => {
+             console.log(`[createLiveFetch] Invalidation received for key: ${key}`);
+             handleInvalidation(shouldAutoRefetch);
         });
+
+        // Dual Subscription: Watch Path Pattern as well if different
+        let unsub2 = () => {};
+        if (path !== key) {
+            console.log(`[createLiveFetch] Subscribing to pattern: ${path}`);
+            unsub2 = client.socket.onInvalidate(path, () => {
+                console.log(`[createLiveFetch] Invalidation received for pattern: ${path}`);
+                handleInvalidation(shouldAutoRefetch);
+            });
+        }
+
+        cleanupFn = () => {
+            unsub1();
+            unsub2();
+        };
     };
 
     createEffect(() => {

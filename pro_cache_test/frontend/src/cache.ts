@@ -12,6 +12,7 @@ const WS_URL = `ws://${window.location.hostname}:8080/ws`;
 export const cache = createProCache({ 
     debug: true,
     autoRefetchOnInvalidation: false,
+    cacheWritesOffline: true, // Enable offline writing
      db: {
         dbName: 'finance_pro_cache',
         dbVersion: 1
@@ -106,8 +107,8 @@ export const cache = createProCache({
                      ctx.cache.invalidate(cacheKey);
                      ctx.broadcast({ type: 'ws-invalidate', key: cacheKey, timestamp });
                      
-                     if (document.hasFocus()) {
-                         console.log(`[App] Manual: Active tab - triggering subscribers immediately`);
+                    if (document.hasFocus()) {
+                         console.log(`[App] Manual: Active tab - triggering subscribers immediately`,cacheKey);
                          ctx.triggerSubscribers(cacheKey);
                      } else {
                          console.log(`[App] Manual: Background tab - polling subscribers`);

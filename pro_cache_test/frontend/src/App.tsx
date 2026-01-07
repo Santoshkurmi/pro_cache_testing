@@ -84,7 +84,7 @@ function App() {
     { 
       params:{},
       query:{},
-        autoRefetch: false // Manually testing this behavior now
+        autoRefetch: true // Manually testing this behavior now
     }
   );
 
@@ -180,6 +180,7 @@ function App() {
               {todo.title}
             </span>
             <button onClick={() => deleteTodo(todo.id)}>x</button>
+            <button onClick={() => setSelectedId(todo.id)} style={{ marginLeft: 5 }}>View</button>
           </li>
         ))}
       </ul>
