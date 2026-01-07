@@ -13,6 +13,8 @@ export type RouteSource = string | RouteDef;
 export interface LiveFetchOptions {
     cacheKey?: string;
     autoRefetch?: boolean;
+    params?: Record<string, string | number>;
+    query?: Record<string, string | number>;
 }
 
 export interface LiveFetchResult<T> {
@@ -25,31 +27,28 @@ export interface LiveFetchResult<T> {
 export function createLiveFetch<T>(
     client: ProCacheClient,
     source: Accessor<RouteSource> | RouteSource,
-    params?: Accessor<Record<string, string | number> | undefined> | Record<string, string | number>,
     options?: Accessor<LiveFetchOptions | undefined> | LiveFetchOptions
-): [Resource<T | undefined>, { 
-    refetch: (info?: unknown) => T | Promise<T | undefined> | undefined | null; 
-    isRefetching: Accessor<boolean>; 
-    isRefetchNeeded: Accessor<boolean>; 
-}] {
+): [Resource<T | undefined>, { refetch: (info?: unknown) => any; isRefetching: Accessor<boolean>; isRefetchNeeded: Accessor<boolean> }] {
     // 1. Internal Signals
     const [isRefetching, setIsRefetching] = createSignal(false);
     const [isRefetchNeeded, setIsRefetchNeeded] = createSignal(false);
+
+    // 1. Reactive Input Normalization
+    // We don't need dedicated signals, we can just derive execution arguments inside the fetcher
 
     // 2. Create the resource
     // The source function combines the route, params, and version to trigger updates
     const [data, { refetch: originalRefetch }] = createResource(
         () => {
             const s = typeof source === 'function' ? (source as Accessor<RouteSource>)() : source;
-            const p = typeof params === 'function' ? (params as Accessor<Record<string, string | number> | undefined>)() : params;
             const o = typeof options === 'function' ? (options as Accessor<LiveFetchOptions | undefined>)() : options;
             // Return a tracking object that includes version
-            return { source: s, params: p, options: o };
+            return { source: s, options: o };
         },
-        async ({ source, params, options }) => {
+        async ({ source, options }) => {
             // Unpack and fetch
             try {
-                return await client.fetch<T>(source, params, options?.cacheKey);
+                return await client.fetch<T>(source, options?.params, options?.query, options?.cacheKey);
             } finally {
                setIsRefetching(false);
             }
@@ -78,14 +77,13 @@ export function createLiveFetch<T>(
         }
 
         const s = typeof source === 'function' ? (source as Accessor<RouteSource>)() : source;
-        const p = typeof params === 'function' ? (params as Accessor<Record<string, string | number> | undefined>)() : params;
         const o = typeof options === 'function' ? (options as Accessor<LiveFetchOptions | undefined>)() : options;
         
         if (!s) return;
 
         const path = typeof s === 'string' ? s : s.path;
         
-        const url = client.buildPath(path, p);
+        const url = client.buildPath(path, o?.params, o?.query);
         const key = o?.cacheKey || url;
         
         // Resolve autoRefetch: Option > Config > Default (false)

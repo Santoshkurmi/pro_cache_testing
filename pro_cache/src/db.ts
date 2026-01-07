@@ -161,12 +161,31 @@ export class IndexedDBCache {
 
     // ========== Cache Operations ==========
 
-    async setCache(key: string, data: CachedData): Promise<void> {
+    /**
+     * Set cache item within a bucket (Route Pattern)
+     */
+    async setCache(bucket: string, key: string, data: CachedData): Promise<void> {
         try {
             const db = await this.ensureDB();
             const tx = db.transaction(this.config.cacheStoreName!, 'readwrite');
             const store = tx.objectStore(this.config.cacheStoreName!);
-            store.put(data, key);
+            
+            // Get existing bucket or create new
+            const getReq = store.get(bucket);
+            
+            getReq.onsuccess = () => {
+                const bucketMap: Record<string, CachedData> = getReq.result || {};
+                bucketMap[key] = data;
+                store.put(bucketMap, bucket);
+            };
+            
+            getReq.onerror = () => {
+                // Fallback: just try to put new bucket
+                const bucketMap: Record<string, CachedData> = {};
+                bucketMap[key] = data;
+                store.put(bucketMap, bucket);
+            };
+
             await new Promise((resolve, reject) => {
                 tx.oncomplete = resolve;
                 tx.onerror = () => reject(tx.error);
@@ -176,15 +195,21 @@ export class IndexedDBCache {
         }
     }
 
-    async getCache(key: string): Promise<CachedData | null> {
+    /**
+     * Get specific cache item from a bucket
+     */
+    async getCache(bucket: string, key: string): Promise<CachedData | null> {
         try {
             const db = await this.ensureDB();
             const tx = db.transaction(this.config.cacheStoreName!, 'readonly');
             const store = tx.objectStore(this.config.cacheStoreName!);
-            const request = store.get(key);
+            const request = store.get(bucket);
             
             return new Promise((resolve, reject) => {
-                request.onsuccess = () => resolve(request.result ?? null);
+                request.onsuccess = () => {
+                    const bucketMap: Record<string, CachedData> = request.result || {};
+                    resolve(bucketMap[key] || null);
+                };
                 request.onerror = () => reject(request.error);
             });
         } catch (e) {
@@ -193,18 +218,41 @@ export class IndexedDBCache {
         }
     }
 
-    async deleteCache(key: string): Promise<void> {
+    /**
+     * Get entire bucket (for sync/init)
+     */
+    async getBucket(bucket: string): Promise<Record<string, CachedData> | null> {
+         try {
+            const db = await this.ensureDB();
+            const tx = db.transaction(this.config.cacheStoreName!, 'readonly');
+            const store = tx.objectStore(this.config.cacheStoreName!);
+            const request = store.get(bucket);
+            
+            return new Promise((resolve, reject) => {
+                request.onsuccess = () => resolve(request.result || null);
+                request.onerror = () => reject(request.error);
+            });
+        } catch (e) {
+            console.warn('[IndexedDB] Failed to get bucket', e);
+            return null;
+        }
+    }
+
+    /**
+     * Delete entire bucket (Invalidation)
+     */
+    async deleteCache(bucket: string): Promise<void> {
         try {
             const db = await this.ensureDB();
             const tx = db.transaction(this.config.cacheStoreName!, 'readwrite');
             const store = tx.objectStore(this.config.cacheStoreName!);
-            store.delete(key);
+            store.delete(bucket); // Deletes the whole bucket (Map of items)
             await new Promise((resolve, reject) => {
                 tx.oncomplete = resolve;
                 tx.onerror = () => reject(tx.error);
             });
         } catch (e) {
-            console.warn('[IndexedDB] Failed to delete cache', e);
+            console.warn('[IndexedDB] Failed to delete cache bucket', e);
         }
     }
 
@@ -245,5 +293,21 @@ export class IndexedDBCache {
             this.clearCache(),
             this.clearTimestamps()
         ]);
+    }
+    
+    // Helper to get all keys (buckets) - useful for debugging
+    async getAllBucketKeys(): Promise<string[]> {
+        try {
+            const db = await this.ensureDB();
+            const tx = db.transaction(this.config.cacheStoreName!, 'readonly');
+            const store = tx.objectStore(this.config.cacheStoreName!);
+            const request = store.getAllKeys();
+             return new Promise((resolve, reject) => {
+                request.onsuccess = () => resolve((request.result || []) as string[]);
+                request.onerror = () => reject(request.error);
+            });
+        } catch (e) {
+             return [];
+        }
     }
 }

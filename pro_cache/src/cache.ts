@@ -5,17 +5,19 @@ export interface CacheItem<T = any> {
     expiry: number;
 }
 
+// Updated Message types for Bucket Strategy
 type CacheMessage = 
-    | { type: 'cache-set', key: string, data: any, expiry: number }
-    | { type: 'cache-invalidate', pattern: string }
+    | { type: 'cache-set', bucket: string, key: string, data: any, expiry: number }
+    | { type: 'cache-invalidate', bucket: string } // Invalidate entire bucket
     | { type: 'cache-request', requestId: string }
-    | { type: 'cache-response', requestId: string, cache: Array<[string, CacheItem]> };
+    | { type: 'cache-response', requestId: string, cache: Array<[string, Record<string, CacheItem>]> }; // [Bucket, MapObject]
 
 export class CacheManager {
-    private cache: Map<string, CacheItem> = new Map();
+    // Nested Map: Bucket -> (SpecificKey -> Item)
+    private cache: Map<string, Map<string, CacheItem>> = new Map();
     private channel: BroadcastChannel | null = null;
     private isInitialized = false;
-    private pendingRequests: Map<string, (cache: Array<[string, CacheItem]>) => void> = new Map();
+    private pendingRequests: Map<string, (cache: Array<[string, Record<string, CacheItem>]>) => void> = new Map();
     private db: IndexedDBCache;
     
     // Sync promise - fetchRoute waits for this
@@ -48,12 +50,9 @@ export class CacheManager {
      * Load cache from IndexedDB on init (offline-first)
      */
     private async loadFromIndexedDB() {
-        // Note: We don't validate timestamps here - that happens in socket.ts when connection is established
-        // This provides instant cache hit on page load
         console.debug('[Cache] Loading from IndexedDB...');
-        
-        // For now, we just mark as initialized
-        // The actual cache items will be loaded on-demand from IndexedDB via get()
+        // We rely on lazy loading from DB on get() mostly, but we could preload keys if needed.
+        // For now, just mark initialized.
         this.isInitialized = true;
         this.syncResolve?.();
     }
@@ -71,7 +70,6 @@ export class CacheManager {
      */
     async requestCacheFromOtherTabs(): Promise<void> {
         if (!this.channel || this.isInitialized) {
-            // Already initialized, resolve sync promise
             this.syncResolve?.();
             return;
         }
@@ -83,23 +81,26 @@ export class CacheManager {
                 this.pendingRequests.delete(requestId);
                 this.isInitialized = true;
                 console.debug('[Cache] No response from other tabs, starting fresh');
-                this.syncResolve?.(); // Resolve sync promise
+                this.syncResolve?.();
                 resolve();
-            }, 200); // 200ms timeout for faster first-tab boot
+            }, 200);
 
             // Register promise resolver
-            this.pendingRequests.set(requestId, (cacheData) => {
+            this.pendingRequests.set(requestId, (cacheDump) => {
                 clearTimeout(timeout);
                 this.pendingRequests.delete(requestId);
                 
-                //syncResolve Import cache from other tab
-                cacheData.forEach(([key, item]) => {
-                    this.cache.set(key, item);
+                // Import cache from other tab
+                cacheDump.forEach(([bucket, itemsMap]) => {
+                    const currentBucket = this.getBucketMap(bucket);
+                    Object.entries(itemsMap).forEach(([key, item]) => {
+                        currentBucket.set(key, item);
+                    });
                 });
                 
                 this.isInitialized = true;
-                console.debug(`[Cache] Received ${cacheData.length} items from other tab`);
-                this.syncResolve?.(); // Resolve sync promise
+                console.debug(`[Cache] Received ${cacheDump.length} buckets from other tab`);
+                this.syncResolve?.();
                 resolve();
             });
 
@@ -110,23 +111,27 @@ export class CacheManager {
 
     private handleMessage(msg: CacheMessage) {
         if (msg.type === 'cache-set') {
-            // Set cache from other tab (don't broadcast again)
-            this.cache.set(msg.key, { data: msg.data, expiry: msg.expiry });
-            console.debug(`[Cache] Synced from other tab: ${msg.key}`);
+            // Set cache from other tab
+            this.setLocal(msg.bucket, msg.key, { data: msg.data, expiry: msg.expiry });
+            console.debug(`[Cache] Synced from other tab: ${msg.key} in ${msg.bucket}`);
         } else if (msg.type === 'cache-invalidate') {
-            // Invalidate from other tab (don't broadcast again)
-            this.invalidateLocal(msg.pattern);
-            console.debug(`[Cache] Invalidated from other tab: ${msg.pattern}`);
+            // Invalidate bucket from other tab
+            this.invalidateLocal(msg.bucket);
+            console.debug(`[Cache] Invalidated bucket from other tab: ${msg.bucket}`);
         } else if (msg.type === 'cache-request') {
             // Another tab wants our cache
             if (this.isInitialized && this.cache.size > 0) {
-                const cacheArray = Array.from(this.cache.entries());
+                // Serialize Map<string, Map> to Array<[string, Object]>
+                const dump: Array<[string, Record<string, CacheItem>]> = [];
+                for (const [bucket, map] of this.cache.entries()) {
+                    dump.push([bucket, Object.fromEntries(map)]);
+                }
+
                 this.channel?.postMessage({ 
                     type: 'cache-response', 
                     requestId: msg.requestId, 
-                    cache: cacheArray 
+                    cache: dump 
                 } as CacheMessage);
-                console.debug(`[Cache] Sent ${cacheArray.length} items to new tab`);
             }
         } else if (msg.type === 'cache-response') {
             // Response to our request
@@ -137,112 +142,128 @@ export class CacheManager {
         }
     }
 
+    private getBucketMap(bucket: string): Map<string, CacheItem> {
+        if (!this.cache.has(bucket)) {
+            this.cache.set(bucket, new Map());
+        }
+        return this.cache.get(bucket)!;
+    }
+
+    private setLocal(bucket: string, key: string, item: CacheItem) {
+        const bucketMap = this.getBucketMap(bucket);
+        bucketMap.set(key, item);
+    }
+
     /**
      * Set data in cache with a TTL (in seconds)
-     * Optionally save to IndexedDB for persistence
      */
-    async set(key: string, data: any, ttlSeconds: number, persistToIndexedDB = true) {
+    async set(bucketPattern: string, specificKey: string, data: any, ttlSeconds: number, persistToIndexedDB = true) {
         if (!ttlSeconds || ttlSeconds <= 0) return;
-        
-        // Don't cache null, undefined, or empty data
-        if (data === null || data === undefined) {
-            console.debug(`[Cache] Skipping cache for ${key} - data is null/undefined`);
-            return;
-        }
-        
-        // For arrays, don't cache if empty
-        // if (Array.isArray(data) && data.length === 0) {
-        //     console.debug(`[Cache] Skipping cache for ${key} - empty array`);
-        //     return;
-        // }
+        if (data === null || data === undefined) return;
         
         const expiry = Date.now() + (ttlSeconds * 1000);
-        this.cache.set(key, { data, expiry });
+        
+        // Update Memory
+        this.setLocal(bucketPattern, specificKey, { data, expiry });
         this.isInitialized = true;
-        console.debug(`[Cache] Set ${key} (TTL: ${ttlSeconds}s)`);
 
         // Persist to IndexedDB
         if (persistToIndexedDB) {
-            await this.db.setCache(key, { data, expiry });
+            await this.db.setCache(bucketPattern, specificKey, { data, expiry });
         }
 
         // Broadcast to other tabs
         this.channel?.postMessage({ 
             type: 'cache-set', 
-            key, 
+            bucket: bucketPattern,
+            key: specificKey, 
             data, 
             expiry 
         } as CacheMessage);
     }
 
     /**
-     * Get data from cache if it exists and hasn't expired
-     * Falls back to IndexedDB if not in memory
+     * Get data from cache > memory > DB
      */
-    async get<T>(key: string): Promise<T | null> {
-        // Check memory cache first
-        let item = this.cache.get(key);
+    async get<T>(bucketPattern: string, specificKey: string): Promise<T | null> {
+        const bucketMap = this.getBucketMap(bucketPattern);
+        let item = bucketMap.get(specificKey);
         
         // If not in memory, try IndexedDB
         if (!item) {
-            const dbItem = await this.db.getCache(key);
+            const dbItem = await this.db.getCache(bucketPattern, specificKey);
             if (dbItem) {
                 item = { data: dbItem.data, expiry: dbItem.expiry };
-                // Restore to memory cache
-                this.cache.set(key, item);
-                console.debug(`[Cache] Restored from IndexedDB: ${key}`);
+                // Restore to memory
+                bucketMap.set(specificKey, item);
+                console.debug(`[Cache] Restored from IndexedDB: ${specificKey}`);
             }
         }
         
         if (!item) return null;
 
         if (Date.now() > item.expiry) {
-            this.cache.delete(key);
-            await this.db.deleteCache(key);
-            console.debug(`[Cache] Expired ${key}`);
+            bucketMap.delete(specificKey);
             return null;
         }
         
-        // Validate that data exists and is not null/undefined
-        if (item.data === null || item.data === undefined) {
-            console.debug(`[Cache] Invalid data for ${key} - returning null`);
-            this.cache.delete(key);
-            await this.db.deleteCache(key);
-            return null;
-        }
-
-        console.debug(`[Cache] Hit ${key}`);
         return item.data as T;
     }
 
     /**
-     * Invalidate cache keys locally without broadcasting
+     * Find a key across all buckets (slow, used for polling/unknown bucket)
      */
-    private invalidateLocal(startWithPattern: string) {
-        let count = 0;
-        for (const key of this.cache.keys()) {
-            if (key.startsWith(startWithPattern) || key === startWithPattern) {
-                this.cache.delete(key);
-                // Also delete from IndexedDB
-                this.db.deleteCache(key);
-                count++;
+    async find<T>(specificKey: string): Promise<T | null> {
+        // 1. Search Memory
+        for (const [bucket, map] of this.cache.entries()) {
+            if (map.has(specificKey)) {
+                return this.get<T>(bucket, specificKey);
             }
         }
-        if (count > 0) {
-            console.debug(`[Cache] Invalidated ${count} items matching "${startWithPattern}"`);
+
+        // 2. Search DB (We need a way to find which bucket a key is in, or search all buckets)
+        // Since DB is Bucket -> Map, we can iterate buckets (keys of root store)
+        // This is expensive but pollForCache is rare/background.
+        const buckets = await this.db.getAllBucketKeys();
+        for (const bucket of buckets) {
+             const item = await this.get<T>(bucket, specificKey);
+             if (item) return item;
         }
+        
+        return null;
     }
 
     /**
-     * Invalidate cache keys matching a pattern.
+     * Get all currently cached keys for a bucket (Memory only is fine for notification triggering?)
+     * Ideally we should know about DB keys too, but for invalidation, 
+     * if it's not in memory, no React component is observing it (usually).
      */
-    invalidate(startWithPattern: string) {
-        this.invalidateLocal(startWithPattern);
+    getKeys(bucketPattern: string): string[] {
+        const map = this.cache.get(bucketPattern);
+        return map ? Array.from(map.keys()) : [];
+    }
+
+    /**
+     * Invalidate cache bucket locally
+     */
+    private invalidateLocal(bucketPattern: string) {
+        if (this.cache.has(bucketPattern)) {
+            this.cache.delete(bucketPattern);
+            this.db.deleteCache(bucketPattern);
+        }
+        // Also check if any key matches exactly? No, bucket strategy relies on using the pattern as the bucket name.
+    }
+
+    /**
+     * Invalidate cache bucket matching a pattern
+     */
+    invalidate(bucketPattern: string) {
+        this.invalidateLocal(bucketPattern);
         
-        // Broadcast to other tabs
+        // Broadcast
         this.channel?.postMessage({ 
             type: 'cache-invalidate', 
-            pattern: startWithPattern 
+            bucket: bucketPattern 
         } as CacheMessage);
     }
 

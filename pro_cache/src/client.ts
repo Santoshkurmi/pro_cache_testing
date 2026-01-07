@@ -88,19 +88,21 @@ export class ProCacheClient {
     public async fetch<T>(
         route: RouteDef | string, 
         params?: Record<string, string | number>, 
+        query?: Record<string, string | number>,
         cacheKeyOverride?: string
     ): Promise<T> {
         // Normalize input
         const routeDef: RouteDef = typeof route === 'string' ? { path: route, cache_ttl: this.config.api?.defaultCacheTtl } : route;
+        const routePattern = routeDef.path; // This is the "Bucket" key (e.g. "/user/{id}")
         
-        // Build URL
-        const url = this.buildPath(routeDef.path, params);
-        const key = cacheKeyOverride || url;
+        // Build specific URL/Key
+        const url = this.buildPath(routePattern, params, query);
+        const specificKey = cacheKeyOverride || url; // This is the "Item" key (e.g. "/user/1?q=a")
         const ttl = routeDef.cache_ttl;
         
         // Register background delay if specified
         if (routeDef.background_delay) {
-            this.socket.setRouteDelay(key, routeDef.background_delay);
+            this.socket.setRouteDelay(specificKey, routeDef.background_delay);
         }
         
         // Check if caching is enabled
@@ -127,21 +129,21 @@ export class ProCacheClient {
             await this.cache.waitForSync();
         }
 
-        // 1. Check Cache
+        // 1. Check Cache (Bucket + Specific Key)
         if (cachingEnabled && ttl && ttl > 0) {
-            const cached = await this.cache.get<T>(key);
+            const cached = await this.cache.get<T>(routePattern, specificKey);
             if (cached) {
-                if (this.config.debug) console.log(`[ProCache] CACHE HIT for "${key}"`);
+                if (this.config.debug) console.log(`[ProCache] CACHE HIT for "${specificKey}" in bucket "${routePattern}"`);
                 return cached;
             } else {
-                if (this.config.debug) console.log(`[ProCache] CACHE MISS for "${key}"`);
+                if (this.config.debug) console.log(`[ProCache] CACHE MISS for "${specificKey}" in bucket "${routePattern}"`);
             }
         }
 
         // 2. Check for pending fetch (deduplication)
-        if (this.pendingFetches.has(key)) {
-            if (this.config.debug) console.log(`[ProCache] Waiting for existing request "${key}"`);
-            return this.pendingFetches.get(key) as Promise<T>;
+        if (this.pendingFetches.has(specificKey)) {
+            if (this.config.debug) console.log(`[ProCache] Waiting for existing request "${specificKey}"`);
+            return this.pendingFetches.get(specificKey) as Promise<T>;
         }
 
         // 3. Fetch Network
@@ -160,12 +162,14 @@ export class ProCacheClient {
                     // Extract timestamp from response using user callback
                     const serverTimestamp = this.config.getTimestamp(response);
                     
-                    // Update the timestamp for invalidation logic
-                    await this.db.setTimestamp(key, serverTimestamp);
+                    // Update the timestamp for invalidation logic (associated with the Pattern/Bucket)
+                    // Note: Invalidation usually happens against the Route Pattern
+                    await this.db.setTimestamp(routePattern, serverTimestamp);
                     
                     if (ttl && ttl > 0) {
-                        await this.cache.set(key, data, ttl);
-                        if (this.config.debug) console.log(`[ProCache] Cached "${key}" with TTL ${ttl}s`);
+                        // Store in Bucket: Pattern -> SpecificKey -> Data
+                        await this.cache.set(routePattern, specificKey, data, ttl);
+                        if (this.config.debug) console.log(`[ProCache] Cached "${specificKey}" in bucket "${routePattern}" with TTL ${ttl}s`);
                     }
                 }
 
@@ -173,21 +177,38 @@ export class ProCacheClient {
             } catch (error) {
                 throw error;
             } finally {
-                this.pendingFetches.delete(key);
+                this.pendingFetches.delete(specificKey);
             }
         })();
 
-        this.pendingFetches.set(key, fetchPromise);
+        this.pendingFetches.set(specificKey, fetchPromise);
         return fetchPromise;
     }
 
-    public buildPath(path: string, params?: Record<string, string | number>) {
+    public buildPath(path: string, params?: Record<string, string | number>, query?: Record<string, string | number>) {
         let finalPath = path;
+        
+        // 1. Replace params
         if (params) {
             for (const [key, value] of Object.entries(params)) {
                 finalPath = finalPath.replace(`{${key}}`, String(value));
             }
         }
+        
+        // 2. Handle Query Params
+        if (query && Object.keys(query).length > 0) {
+            const searchParams = new URLSearchParams();
+            for (const [key, value] of Object.entries(query)) {
+                if (value !== undefined && value !== null) {
+                    searchParams.append(key, String(value));
+                }
+            }
+            const queryString = searchParams.toString();
+            if (queryString) {
+                finalPath += (finalPath.includes('?') ? '&' : '?') + queryString;
+            }
+        }
+        
         return finalPath;
     }
 }

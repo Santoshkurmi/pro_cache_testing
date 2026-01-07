@@ -8,6 +8,8 @@ export type RouteSource = string | RouteDef;
 export interface LiveFetchOptions {
     cacheKey?: string;
     autoRefetch?: boolean;
+    params?: Record<string, string | number>;
+    query?: Record<string, string | number>;
 }
 
 export interface LiveFetchResult<T> {
@@ -98,26 +100,26 @@ export function useGlobalInvalidation(callback: () => void) {
 }
 
 /**
- * React Hook for ProCache live fetching
+ * React Hook for live invalidated fetching.
+ * 
+ * @param source Route path or definition
+ * @param options Options including params, query, cacheKey, etc.
  */
 export function useLiveFetch<T>(
     source: RouteSource,
-    params?: Record<string, string | number>,
     options?: LiveFetchOptions
 ): LiveFetchResult<T> {
     const client = useProCache(); // Use client from context
-    
+    const [data, setData] = useState<T | undefined>();
+    const [loading, setLoading] = useState(true);
+    const [error, setError] = useState<any>(null);
+    const [_, setVersion] = useState(0); // Used to trigger refetches manually or via invalidation
+    const [isRefetching, setIsRefetching] = useState(false);
+    const [isRefetchNeeded, setIsRefetchNeeded] = useState(false);
+    const versionRef = useRef(0);
+
     // Resolve autoRefetch: Option > Config > Default (false)
     const shouldAutoRefetch = options?.autoRefetch ?? client.config.autoRefetchOnInvalidation ?? false;
-
-    const [data, setData] = useState<T | undefined>(undefined);
-    const [loading, setLoading] = useState<boolean>(true);
-    const [isRefetching, setIsRefetching] = useState<boolean>(false);
-    const [isRefetchNeeded, setIsRefetchNeeded] = useState<boolean>(false);
-    const [error, setError] = useState<any>(null);
-    
-    // Version Ref to handle race conditions
-    const versionRef = useRef(0);
 
     const fetchData = useCallback(async (isRefetch = false) => {
         const currentVersion = versionRef.current;
@@ -129,10 +131,17 @@ export function useLiveFetch<T>(
         setError(null);
 
         try {
-            const result = await client.fetch<T>(source, params, options?.cacheKey);
+            const result = await client.fetch<T>(
+                source, 
+                options?.params, 
+                options?.query, 
+                options?.cacheKey
+            );
+            
             if (versionRef.current === currentVersion) {
                 setData(result);
                 setIsRefetchNeeded(false); // Reset needed state on successful fetch
+                setVersion(prev => prev + 1); // Use version to trigger re-renders if needed, though setData usually enough
             }
         } catch (err) {
             if (versionRef.current === currentVersion) {
@@ -144,7 +153,7 @@ export function useLiveFetch<T>(
                 else setIsRefetching(false);
             }
         }
-    }, [client, source, JSON.stringify(params), options?.cacheKey]);
+    }, [client, source, JSON.stringify(options?.params), JSON.stringify(options?.query), options?.cacheKey]);
 
     useEffect(() => {
         // Increment version to invalidate previous in-flight requests
@@ -153,7 +162,8 @@ export function useLiveFetch<T>(
 
         // Subscription Logic
         const path = typeof source === 'string' ? source : source.path;
-        const url = client.buildPath(path, params);
+        // Logic: We subscribe to the SPECIFIC KEY for this instance data refetching.
+        const url = client.buildPath(path, options?.params, options?.query);
         const key = options?.cacheKey || url;
 
         console.log(`[useLiveFetch] Subscribing to key: ${key}`);
@@ -173,7 +183,7 @@ export function useLiveFetch<T>(
             console.log(`[useLiveFetch] Unsubscribing from key: ${key}`);
             unsubscribe();
         };
-    }, [fetchData, client, source, JSON.stringify(params), options?.cacheKey, shouldAutoRefetch]);
+    }, [fetchData, client, source, JSON.stringify(options?.params), JSON.stringify(options?.query), options?.cacheKey, shouldAutoRefetch]);
 
     return { 
         data, 

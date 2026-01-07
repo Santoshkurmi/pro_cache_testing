@@ -311,7 +311,7 @@ export class WebSocketClient {
                 callbacks.forEach(cb => cb(key));
                 return;
             }
-            const data = await this.cacheManager.get(key);
+            const data = await this.cacheManager.find(key);
             
             if (data) {
                 console.log(`[WS] Background polling success! Cache populated for ${key}`);
@@ -735,7 +735,7 @@ export class WebSocketClient {
 
     private async defaultMessageHandler(msg: any) {
         // Default route mapper if not provided
-        const routePathToCacheKey = this.config.routeToCacheKey || ((routePath: string) => routePath);
+
         
         // 1. Handle New Format: { type: 'invalidate', data: { key: timestamp, ... } }
         if (msg.type === 'invalidate' && typeof msg.data === 'object' && !Array.isArray(msg.data)) {
@@ -772,18 +772,18 @@ export class WebSocketClient {
                 }
             }
 
-            // Handle specific keys
-            for (const [key, timestamp] of Object.entries(data)) {
+            // Handle specific keys (or buckets)
+            for (const [keyOrBucket, timestamp] of Object.entries(data)) {
                 let shouldUpdate = true;
 
                 if (this.config.shouldInvalidate) {
-                     shouldUpdate = await this.config.shouldInvalidate(key, timestamp, this.db);
+                     shouldUpdate = await this.config.shouldInvalidate(keyOrBucket, timestamp, this.db);
                 } else {
                     // Default behavior: Check local timestamp to see if this is actually new
-                    const localTimestamp = await this.db.getTimestamp(key);
+                    const localTimestamp = await this.db.getTimestamp(keyOrBucket);
                     
                     if (localTimestamp && localTimestamp >= timestamp) {
-                        console.log(`[WS Leader] Ignoring stale invalidation for ${key} (Server: ${timestamp}, Local: ${localTimestamp})`);
+                        console.log(`[WS Leader] Ignoring stale invalidation for ${keyOrBucket} (Server: ${timestamp}, Local: ${localTimestamp})`);
                         shouldUpdate = false;
                     }
                 }
@@ -792,33 +792,90 @@ export class WebSocketClient {
                     continue;
                 }
 
-                console.log(`[WS Leader] Invalidation received for: ${key} at ${timestamp}`);
+                console.log(`[WS Leader] Invalidation received for: ${keyOrBucket} at ${timestamp}`);
                 
+                // 1. Invalidate Cache (Bucket Strategy: Invalidate entire bucket)
+                // This deletes the bucket from DB and Memory
+                this.cacheManager.invalidate(keyOrBucket);
+                
+                // 2. Broadcast to followers
+                this.channel?.postMessage({ type: 'ws-invalidate', key: keyOrBucket, timestamp } as WSMessage);
+                
+                // 3. Trigger Local Subscribers
+                // A) Trigger subscribers for the bucket itself (if any)
+                // B) Trigger subscribers for specific keys inside the bucket
+                //    (We rely on Memory Cache to know active keys, or just trigger invalidation for known patterns if we track them separately?)
+                //    Correction: Invalidation means we should notify anyone listening to this path or its children.
+                //    CacheManager.isolate(keyOrBucket) is done.
+                //    Now we need to find listeners.
+                
+                // Trigger exact match callbacks
+                const exactCallbacks = this.callbacks.get(keyOrBucket) || [];
+                exactCallbacks.forEach(cb => cb(keyOrBucket));
+
+                // Also traverse all registered callbacks to find those that are "inside" this bucket?
+                // Or does CacheManager know?
+                // If I have `getKeys(bucket)`, I can trigger those.
+                // But `cacheManager` just cleared them! 
+                // Wait, I cleared them *before* getting keys? Mistake.
+                // But notifying "bucket" should be enough if `useLiveFetch` subscribed to the specific key?
+                // The `socket.ts` `callbacks` Map key IS the specific key (e.g. url).
+                
+                // We need to iterate `this.callbacks.keys()` and see if they match the bucket pattern.
+                // Usually this is simple: specificKey startsWith bucketPattern? 
+                // Or if bucketPattern='/user/{id}' and specificKey='/user/1', string match won't work.
+                
+                // We need `routeToCacheKey` logic or regex matching.
+                // Since we don't have robust regex stored, we can rely on `routeToCacheKey` if available.
+                // User said: "invalidate , I can invalidte by using the route (route ... withotu the query and param)"
+                
+                // If the user sends `/user/{id}`, we can't easily match `/user/1` without parsing.
+                // BUT, if we assume the standard pattern:
+                // If `callbacks` has `/user/1`, does it match `/user/{id}`?
+                
+                // Simplification for now:
+                // Trigger global callbacks (done)
+                // Trigger exact matches (done)
+                // Trigger "Pattern Matches" if we can.
+                
+                // If the user meant "Route Path" as the key, then:
+                // `socket.onInvalidate(key)` -> `key` is expected to be the specific URL.
+                
+                // Let's iterate all known callbacks and check if they "belong" to this bucket.
+                // How? 
+                // Maybe we don't need to. If `react.ts` subscribed to the *specific key*, and we receive *bucket*.
+                // Use a simple `includes` or `startsWith` check as a fallback?
+                // Or rely on `cacheManager.getKeys(bucket)` BEFORE invalidating?
+                
+                // Let's modify logic:
+                // 1. Get known keys in this bucket from CacheManager (before invalidating!).
+                // 2. Invalidate.
+                // 3. Trigger callbacks for those keys.
+                
+                // Wait, if it's not in cache, we don't care (no data to show).
+                // If it IS in cache (memory), we know the key.
+                
+                // So:
+                const internalKeys = this.cacheManager.getKeys(keyOrBucket);
+                
+                this.cacheManager.invalidate(keyOrBucket);
+
+                internalKeys.forEach(activeKey => {
+                     const cbs = this.callbacks.get(activeKey);
+                     if (cbs) cbs.forEach(cb => cb(activeKey));
+                });
+                
+                // Also trigger exact bucket callbacks
+                // (Already done above)
+
                 // Note: We do NOT update the local timestamp here anymore.
                 // The timestamp in DB represents the "fetch time" of the current data.
                 // We only invalidate if Server Timestamp > Fetch Timestamp.
                 // If we fetch new data later, the fetch logic will update the timestamp.
 
-                const cacheKey = routePathToCacheKey(key);
-                this.cacheManager.invalidate(cacheKey);
-                
-                // Broadcast to followers IMMEDIATELY
-                console.log(`[WS Leader] Broadcasting update to followers: ${cacheKey}`);
-                this.channel?.postMessage({ type: 'ws-invalidate', key: cacheKey, timestamp } as WSMessage);
 
-                const callbacks = this.callbacks.get(cacheKey) || [];
                 
-                // Check if we are the focused tab
-                const isFocused = typeof document !== 'undefined' && document.hasFocus();
 
-                if (isFocused) {
-                    // We are active - Refetch immediately
-                    console.log(`[WS Leader] Active tab - triggering ${callbacks.length} callbacks immediately`);
-                    callbacks.forEach(cb => cb(cacheKey));
-                } else {
-                    // We are background - Poll for cache update from active tab
-                    this.pollForCache(cacheKey, callbacks);
-                }
             }
             
             this.setRecentActivity(true);

@@ -80,8 +80,9 @@ function App() {
   // BaseURL in client.ts defaults to '/api'. So fetching ''/todos' -> '/api/todos'.
     const { data: todos, loading, refetch, isRefetching, isRefetchNeeded } = useLiveFetch<any[]>(
     '/todos', // Path (relative to /api)
-    {},       // Params
     { 
+      params:{},
+      query:{},
         cacheKey: '/todo.list',
         autoRefetch: false // Manually testing this behavior now
     }
