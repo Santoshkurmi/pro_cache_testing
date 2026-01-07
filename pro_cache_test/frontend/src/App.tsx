@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import { useLiveFetch, useProCacheStatus, useGlobalInvalidation } from 'pro_cache';
+import { TodoDetail } from './TodoDetail';
 import { cache, setCacheToken } from './cache';
 
 const API_URL = `http://${window.location.hostname}:3001/api`;
@@ -83,10 +84,12 @@ function App() {
     { 
       params:{},
       query:{},
-        cacheKey: '/todo.list',
         autoRefetch: false // Manually testing this behavior now
     }
   );
+
+  // State for navigation
+  const [selectedId, setSelectedId] = useState<number | null>(null);
 
   // 3. Mutations
   const addTodo = async (e: React.FormEvent) => {
@@ -99,7 +102,7 @@ function App() {
 
   const toggleTodo = async (id: number, completed: boolean) => {
     await axios.put(`${API_URL}/todos/${id}`, { completed: !completed });
-    refetch(); // Manual update
+    // Note: This will trigger invalidation from backend -> socket -> client
   };
 
   const deleteTodo = async (id: number) => {
@@ -124,11 +127,15 @@ function App() {
     );
   }
 
+  if (selectedId !== null) {
+      return <TodoDetail id={selectedId} onBack={() => setSelectedId(null)} />;
+  }
+
+  // Render List
   return (
     <div style={{ padding: 20 }}>
-      {/* Header with Logout */}
+      <h1>ProCache Todo List ({userId})</h1>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <h1>Todo App ({userId})</h1>
           <button onClick={handleLogout} style={{ height: 'fit-content' }}>Logout</button>
       </div>
       <div style={{ background: '#eee', padding: 5, fontSize: 12, marginBottom: 10, display: 'flex', gap: 10 }}>

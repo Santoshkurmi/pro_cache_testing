@@ -48,14 +48,18 @@ pub async fn ws_handler(
     let user_id = token_data.user_id.clone();
     let session_id = Uuid::new_v4();
 
-    // 5. Send Initial Invalidation State
-    // User Requirement: "if server restarted send to array 'all' string to know to clear all"
-    
+    // 5. Send Initial Invalidation State (Full Sync)
+    // We send a map of { route_path: timestamp }
+    // If empty (server restart), client will see empty map and clear its local cache (Sync).
+    let initial_routes: std::collections::HashMap<String, i64> = if let Some(proj_map) = data.project_invalidation_state.get(&project_id) {
+        proj_map.iter().map(|r| (r.key().clone(), *r.value())).collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let all_sync = serde_json::json!({
         "type": "invalidate",
-        "data": {
-            "all": data.server_start_time
-        }
+        "data": initial_routes
     });
     let _ = session.text(all_sync.to_string()).await;
 

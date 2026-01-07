@@ -54,7 +54,7 @@ pub async fn invalidate(
 
     // 2. Broadcast Delta
     let message = serde_json::json!({
-        "type": "invalidate",
+        "type": "invalidate-delta",
         "data": {
             path: timestamp
         }

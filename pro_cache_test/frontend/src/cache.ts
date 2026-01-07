@@ -47,29 +47,56 @@ export const cache = createProCache({
             }
             return true;
         },
-        handleMessage: async (msg, ctx) => {
+        handleMessage: async (msg, ctx, defaultHandler) => {
              console.log('[App] Custom Message Middleware:', msg);
+
+             // Handle maintenance mode
              if (msg.type === 'server-maintenance') {
                  alert('Maintenance Mode: ' + msg.message);
                  return;
              }
 
-             if (msg.type === 'invalidate' && msg.data) {
-                 const data = msg.data;
-                 const keys = Object.keys(data);
+             // 2. Manual Invalidation Handling (Sync/Delta)
+             // User explicitly wants to demonstrate/override this logic here.
+             if (msg.type === 'invalidate' || msg.type === 'invalidate-delta') {
+                 const data = msg.data as Record<string, number>;
                  
-                 if (keys.includes('all')) {
-                     console.log('[App] Manual: Clearing ALL cache');
-                     ctx.cache.clear();
-                     await ctx.db.clearAll();
-                     ctx.broadcast({ type: 'ws-invalidate-all', timestamp: data['all'] });
+                 // A) Full Sync Logic (type: 'invalidate')
+                 if (msg.type === 'invalidate') {
+                     const keys = Object.keys(data);
+                     if (keys.length === 0) {
+                         console.log('[App] Manual: Full Sync - Empty Data (Server Restart) -> Clearing ALL');
+                         ctx.cache.clear();
+                         await ctx.db.clearAll();
+                         ctx.broadcast({ type: 'ws-invalidate-all', timestamp: Date.now() });
+                         return;
+                     }
+                     
+                     // Filter only "Fresh" keys (those we want to KEEP)
+                     const validCacheKeys: string[] = [];
+                     
+                     for (const [key, timestamp] of Object.entries(data)) {
+                         const localTs = await ctx.db.getTimestamp(key);
+                         // If Local is Fresh (>= Server), we keep it.
+                         if (localTs && localTs >= timestamp) {
+                             validCacheKeys.push(ctx.routeToCacheKey(key));
+                         } else {
+                             // If Stale or Missing locally, we don't add it to validCacheKeys.
+                             // invalidateExcept will wipe it out.
+                             console.log(`[App] Manual: Stale data detected for ${key} - will be cleared by sync`);
+                         }
+                     }
+
+                     console.log('[App] Manual: Full Sync - Keeping valid keys, clearing others (Stale + Missing)');
+                     await ctx.invalidateExcept(validCacheKeys);
                      return;
                  }
 
+                 // B) Handle Updates (Delta only)
                  for (const [key, timestamp] of Object.entries(data)) {
                      const localTs = await ctx.db.getTimestamp(key);
                      
-                     if (localTs && localTs >= (timestamp as number)) {
+                     if (localTs && localTs >= timestamp) {
                          console.log(`[App] Manual: Ignoring stale ${key}`);
                          continue;
                      }
@@ -77,7 +104,6 @@ export const cache = createProCache({
                      const cacheKey = ctx.routeToCacheKey(key);
                      console.log(`[App] Manual: Invalidating ${cacheKey} (from ${key})`);
                      ctx.cache.invalidate(cacheKey);
-                     console.log(`[App] Manual: Broadcasting update to followers: ${cacheKey}`);
                      ctx.broadcast({ type: 'ws-invalidate', key: cacheKey, timestamp });
                      
                      if (document.hasFocus()) {
@@ -90,8 +116,11 @@ export const cache = createProCache({
                  }
                  return;
              }
-             
-             console.warn('[App] Unknown message type:', msg.type);
+
+             // 3. Default for everything else
+             if (defaultHandler) {
+                 await defaultHandler(msg);
+             }
         }
     }
 });

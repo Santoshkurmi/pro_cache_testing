@@ -69,6 +69,14 @@ app.get('/api/todos', (req, res) => {
     res.json(todos);
 });
 
+// 2b. Get Todo Detail
+app.get('/api/todos/:id', (req, res) => {
+    const id = parseInt(req.params.id);
+    const todo = todos.find(t => t.id === id);
+    if (!todo) return res.status(404).send('Not found');
+    res.json(todo);
+});
+
 // 3. Create Todo
 app.post('/api/todos', async (req, res) => {
     const { title } = req.body;
@@ -76,9 +84,7 @@ app.post('/api/todos', async (req, res) => {
     todos.push(newTodo);
     
     // Invalidate list
-    // User requested "use route name instead of route path"
-    // pro_cache requires keys to start with / for auto-detection logic
-    await invalidate('/todo.list'); 
+    await invalidate('/todos'); 
     
     res.json(newTodo);
 });
@@ -94,9 +100,11 @@ app.put('/api/todos/:id', async (req, res) => {
     if (title !== undefined) todo.title = title;
     if (completed !== undefined) todo.completed = completed;
     
-    // Invalidate list AND detail
-    await invalidate('/todo.list');
-    await invalidate(`/todo.detail.${id}`); // Example detail route name
+    // Invalidate list AND detail bucket
+    await invalidate('/todos');
+    // Invalidate the BUCKET (Route Pattern).
+    // This will clear /todos/1, /todos/2, etc. because they all belong to this pattern.
+    await invalidate('/todos/{id}'); 
     
     res.json(todo);
 });
@@ -105,8 +113,9 @@ app.put('/api/todos/:id', async (req, res) => {
 app.delete('/api/todos/:id', async (req, res) => {
     const id = parseInt(req.params.id);
     todos = todos.filter(t => t.id !== id);
-    
-    await invalidate('/todo.list');
+    await invalidate('/todos/{id}'); 
+    await invalidate('/todos'); 
+
     
     res.json({ success: true });
 });
