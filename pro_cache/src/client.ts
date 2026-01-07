@@ -1,4 +1,4 @@
-import axios, { type AxiosInstance } from 'axios';
+import axios, { type AxiosInstance, type AxiosResponse } from 'axios';
 import { IndexedDBCache, type IndexedDBConfig } from './db';
 import { CacheManager } from './cache';
 import { WebSocketClient, type WebSocketConfig } from './socket';
@@ -12,6 +12,8 @@ export interface ProCacheConfig {
         defaultCacheTtl?: number;
     };
     debug?: boolean;
+    autoRefetchOnInvalidation?: boolean;
+    getTimestamp?: (response: AxiosResponse) => number;
 }
 
 export interface RouteDef {
@@ -26,8 +28,8 @@ export class ProCacheClient {
     public socket: WebSocketClient;
     public api: AxiosInstance;
     
-    private pendingFetches = new Map<string, Promise<any>>();
-    private config: ProCacheConfig;
+    public pendingFetches = new Map<string, Promise<any>>();
+    public config: ProCacheConfig;
 
     constructor(config: ProCacheConfig) {
         this.config = config;
@@ -102,7 +104,23 @@ export class ProCacheClient {
         }
         
         // Check if caching is enabled
-        const cachingEnabled = this.socket.isCacheEnabled();
+        let cachingEnabled = this.socket.isCacheEnabled();
+
+        // 0. Wait for Socket (if configured)
+        if (this.config.ws?.startup?.waitForSocket && !cachingEnabled && this.socket.wsStatus() !== 'connected') {
+             const timeout = this.config.ws.startup.socketWaitTimeout ?? 5000;
+             if (this.config.debug) console.log(`[ProCache] Waiting for socket connection (max ${timeout}ms)...`);
+             
+             const connected = await this.socket.waitForConnection(timeout);
+             
+             if (connected) {
+                 if (this.config.debug) console.log(`[ProCache] Socket connected, proceeding with fetch`);
+                 // Re-check cache enabled status (it might have flipped to true on connect)
+                 cachingEnabled = this.socket.isCacheEnabled(); 
+             } else {
+                 console.warn(`[ProCache] Socket wait timed out, proceeding with default cache state: ${cachingEnabled}`);
+             }
+        }
 
         // Wait for cache sync from other tabs
         if (cachingEnabled) {
@@ -134,9 +152,21 @@ export class ProCacheClient {
                 const data = response.data;
 
                 // 4. Set Cache
-                if (cachingEnabled && ttl && ttl > 0) {
-                    await this.cache.set(key, data, ttl);
-                    if (this.config.debug) console.log(`[ProCache] Cached "${key}" with TTL ${ttl}s`);
+                if (cachingEnabled) {
+                    if (!this.config.getTimestamp) {
+                        throw new Error('[ProCache] Caching is enabled but "getTimestamp" callback is missing in config. You must provide a way to extract the server timestamp from the response to ensure data consistency.');
+                    }
+
+                    // Extract timestamp from response using user callback
+                    const serverTimestamp = this.config.getTimestamp(response);
+                    
+                    // Update the timestamp for invalidation logic
+                    await this.db.setTimestamp(key, serverTimestamp);
+                    
+                    if (ttl && ttl > 0) {
+                        await this.cache.set(key, data, ttl);
+                        if (this.config.debug) console.log(`[ProCache] Cached "${key}" with TTL ${ttl}s`);
+                    }
                 }
 
                 return data;

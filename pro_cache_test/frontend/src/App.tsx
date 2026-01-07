@@ -1,41 +1,17 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { createProCache, useLiveFetch, ProCacheClient } from 'pro_cache';
-
-// Initialize Cache Global
-// Use a mutable variable for token to allow dynamic updates via function-based URL
-let currentToken = '';
-
-const apiBase = `http://${window.location.hostname}:3001/api`;
-
-const cache = createProCache({ 
-    debug: true,
-     db: {
-        dbName: 'finance_pro_cache',
-        dbVersion: 1
-    }, 
-    api: {
-        baseUrl: apiBase,
-        defaultCacheTtl: 600 // 5 Minutes Cache
-        // axiosInstance: axios, //use axios instance if needed
-    },
-    ws: {
-        // pro_cache supports function for URL to allow dynamic values
-        url: () => `${WS_URL}?token=${currentToken}`,
-        routeToCacheKey: (routePath: string) => {
-            // Identity mapping for now. 
-            // If backend sends specific keys, we might need a map here or ensure consistency.
-            return routePath;
-        },
-        defaultBackgroundDelay: 1000, // Testing: 5 seconds max wait for background tabs
-        backgroundPollInterval: 200   // Testing: Poll every 200ms
-    }
-});
+import { useLiveFetch, useProCacheStatus, useGlobalInvalidation } from 'pro_cache';
+import { cache, setCacheToken } from './cache';
 
 const API_URL = `http://${window.location.hostname}:3001/api`;
-const WS_URL = `ws://${window.location.hostname}:8080/ws`;
 
 function App() {
+  const { wsStatus, isOnline, recentActivity, isLeaderTab } = useProCacheStatus();
+  
+  useGlobalInvalidation(() => {
+    alert('Global cache invalidation received! Refreshing all data...');
+  });
+
   const [userId, setUserId] = useState(localStorage.getItem('userId'));
   const [token, setToken] = useState(localStorage.getItem('token'));
   const [projectId, setProjectId] = useState('');
@@ -68,7 +44,7 @@ function App() {
     setProjectId('');
     localStorage.removeItem('userId');
     localStorage.removeItem('token');
-    // derived currentToken and socket cleanup happens in useEffect([token])
+    setCacheToken(''); // Reset token
   };
 
   // Restore session
@@ -81,8 +57,7 @@ function App() {
   useEffect(() => {
     if (token) {
         console.log("Updating WebSocket Token...");
-        // Update the reference used by the URL function
-        currentToken = token;
+        setCacheToken(token); // Update token reference
 
         // Update API token for pro_cache axios instance
         cache.api.defaults.headers.common['Authorization'] = `Bearer ${token}`; 
@@ -103,12 +78,12 @@ function App() {
   // Key: "todo.list"
   // Path: "/todos" (relative to baseURL default /api is set in client, but let's be explicit if needed)
   // BaseURL in client.ts defaults to '/api'. So fetching ''/todos' -> '/api/todos'.
-  const { data: todos, loading, refetch } = useLiveFetch<any[]>(
-    cache,
+    const { data: todos, loading, refetch, isRefetching, isRefetchNeeded } = useLiveFetch<any[]>(
     '/todos', // Path (relative to /api)
     {},       // Params
     { 
-        cacheKey: '/todo.list'
+        cacheKey: '/todo.list',
+        autoRefetch: false // Manually testing this behavior now
     }
   );
 
@@ -155,6 +130,12 @@ function App() {
           <h1>Todo App ({userId})</h1>
           <button onClick={handleLogout} style={{ height: 'fit-content' }}>Logout</button>
       </div>
+      <div style={{ background: '#eee', padding: 5, fontSize: 12, marginBottom: 10, display: 'flex', gap: 10 }}>
+          <span>Status: <b>{wsStatus}</b></span>
+          <span>Online: <b>{isOnline ? 'YES' : 'NO'}</b></span>
+          <span>Tab: <b>{isLeaderTab ? 'LEADER' : 'FOLLOWER'}</b></span>
+          <span>Activity: <b>{recentActivity ? 'ACTIVE' : 'IDLE'}</b></span>
+      </div>
       <p>Project: {projectId}</p>
 
       <div style={{ marginBottom: 20 }}>
@@ -169,6 +150,13 @@ function App() {
       </div>
 
       {loading && <p>Loading...</p>}
+      {isRefetching && <p style={{ color: 'blue' }}>Updating...</p>}
+      {isRefetchNeeded && (
+          <div style={{ background: 'yellow', padding: 10, marginBottom: 10 }}>
+              <span>New data available! </span>
+              <button onClick={() => refetch()}>Refresh Now</button>
+          </div>
+      )}
       
       <ul>
         {(todos || []).map((todo: any) => (

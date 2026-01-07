@@ -1,4 +1,4 @@
-import { createResource, onCleanup, type Accessor, type Resource, createEffect } from 'solid-js';
+import { createResource, onCleanup, type Accessor, type Resource, createEffect, createSignal } from 'solid-js';
 import { ProCacheClient, type RouteDef } from './client';
 
 export type RouteSource = string | RouteDef;
@@ -12,6 +12,14 @@ export type RouteSource = string | RouteDef;
  */
 export interface LiveFetchOptions {
     cacheKey?: string;
+    autoRefetch?: boolean;
+}
+
+export interface LiveFetchResult<T> {
+    data: Resource<T | undefined>;
+    refetch: (info?: unknown) => T | Promise<T | undefined> | undefined | null;
+    isRefetching: Accessor<boolean>;
+    isRefetchNeeded: Accessor<boolean>;
 }
 
 export function createLiveFetch<T>(
@@ -19,13 +27,18 @@ export function createLiveFetch<T>(
     source: Accessor<RouteSource> | RouteSource,
     params?: Accessor<Record<string, string | number> | undefined> | Record<string, string | number>,
     options?: Accessor<LiveFetchOptions | undefined> | LiveFetchOptions
-): [Resource<T | undefined>, { refetch: (info?: unknown) => T | Promise<T | undefined> | undefined | null }] {
-    // 1. Version signal to trigger refetch
-
+): [Resource<T | undefined>, { 
+    refetch: (info?: unknown) => T | Promise<T | undefined> | undefined | null; 
+    isRefetching: Accessor<boolean>; 
+    isRefetchNeeded: Accessor<boolean>; 
+}] {
+    // 1. Internal Signals
+    const [isRefetching, setIsRefetching] = createSignal(false);
+    const [isRefetchNeeded, setIsRefetchNeeded] = createSignal(false);
 
     // 2. Create the resource
     // The source function combines the route, params, and version to trigger updates
-    const [data, { refetch }] = createResource(
+    const [data, { refetch: originalRefetch }] = createResource(
         () => {
             const s = typeof source === 'function' ? (source as Accessor<RouteSource>)() : source;
             const p = typeof params === 'function' ? (params as Accessor<Record<string, string | number> | undefined>)() : params;
@@ -35,9 +48,20 @@ export function createLiveFetch<T>(
         },
         async ({ source, params, options }) => {
             // Unpack and fetch
-            return client.fetch<T>(source, params, options?.cacheKey);
+            try {
+                return await client.fetch<T>(source, params, options?.cacheKey);
+            } finally {
+               setIsRefetching(false);
+            }
         }
     );
+
+    // Wrapped refetch to toggle isRefetching
+    const refetch = (info?: unknown) => {
+        setIsRefetching(true);
+        setIsRefetchNeeded(false); // Reset needed state
+        return originalRefetch(info);
+    };
 
     // 3. Setup Socket Subscription
     
@@ -63,12 +87,21 @@ export function createLiveFetch<T>(
         
         const url = client.buildPath(path, p);
         const key = o?.cacheKey || url;
+        
+        // Resolve autoRefetch: Option > Config > Default (false)
+        const shouldAutoRefetch = o?.autoRefetch ?? client.config.autoRefetchOnInvalidation ?? false;
 
         console.log(`[createLiveFetch] Subscribing to key: ${key}`);
         cleanupFn = client.socket.onInvalidate(key, () => {
-             console.log(`[createLiveFetch] Invalidation received for key: ${key}, triggering refetch`);
-             // Use refetch from createResource directly
-             refetch();
+             console.log(`[createLiveFetch] Invalidation received for key: ${key}`);
+             
+             if (shouldAutoRefetch) {
+                 console.log(`[createLiveFetch] Auto-refetching...`);
+                 refetch();
+             } else {
+                 console.log(`[createLiveFetch] Marked as needed (autoRefetch disabled).`);
+                 setIsRefetchNeeded(true);
+             }
         });
     };
 
@@ -80,5 +113,21 @@ export function createLiveFetch<T>(
         if (cleanupFn) cleanupFn();
     });
 
-    return [data, { refetch }];
+    return [data, { refetch, isRefetching, isRefetchNeeded }];
+}
+
+/**
+ * SolidJS Primitive to subscribe to global invalidations ("all" events)
+ */
+export function createGlobalInvalidation(client: ProCacheClient, callback: () => void) {
+    let cleanupFn: (() => void) | null = null;
+    
+    createEffect(() => {
+        if (cleanupFn) cleanupFn();
+        cleanupFn = client.socket.onGlobalInvalidate(callback);
+    });
+
+    onCleanup(() => {
+        if (cleanupFn) cleanupFn();
+    });
 }

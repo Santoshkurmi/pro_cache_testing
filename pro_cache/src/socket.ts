@@ -5,7 +5,8 @@ import { IndexedDBCache } from './db';
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error' | 'offline';
 
 export type WSMessage = 
-    | { type: 'ws-invalidate', key: string }
+    | { type: 'ws-invalidate', key: string, timestamp: number }
+    | { type: 'ws-invalidate-all', timestamp: number }
     | { type: 'ws-status', status: ConnectionStatus }
     | { type: 'leader-claim', tabId: string }
     | { type: 'leader-query' }
@@ -15,12 +16,28 @@ export type WSMessage =
     | { type: 'network-offline' }
     | { type: 'network-online' };
 
+export interface WebSocketContext {
+    db: IndexedDBCache;
+    cache: CacheManager;
+    broadcast: (message: any) => void;
+    triggerSubscribers: (key: string) => void;
+    pollSubscribers: (key: string) => void;
+    routeToCacheKey: (path: string) => string;
+}
+
 export interface WebSocketConfig {
     url: string | (() => string);
     channelName?: string;
     routeToCacheKey?: (routePath: string) => string;
     defaultBackgroundDelay?: number; // Configurable default
     backgroundPollInterval?: number; // Configurable poll interval
+    shouldInvalidate?: (key: string, value: any, db: IndexedDBCache) => Promise<boolean> | boolean;
+    handleMessage?: (msg: any, ctx: WebSocketContext, defaultHandler: (msg: any) => Promise<void>) => Promise<void>;
+    startup?: {
+        enableCacheBeforeSocket?: boolean;
+        waitForSocket?: boolean;
+        socketWaitTimeout?: number;
+    };
 }
 
 export class WebSocketClient {
@@ -127,6 +144,43 @@ export class WebSocketClient {
     public disconnect() {
         this.isExplicitlyClosed = true;
         this.stepDown();
+    }
+
+    /**
+     * Wait for WebSocket connection with timeout
+     */
+    public waitForConnection(timeout: number): Promise<boolean> {
+        if (this.wsStatus() === 'connected') {
+            return Promise.resolve(true);
+        }
+
+        return new Promise((resolve) => {
+            let timer: number | null = null;
+            
+            const check = () => {
+                if (this.wsStatus() === 'connected') {
+                    if (timer) clearTimeout(timer);
+                    resolve(true);
+                }
+            };
+
+            // Use an interval or reactive effect? Effect is better given we have signals.
+            // But we can't createEffect here easily without root tracking leak?
+            // Simple polling for this one-off is safe enough.
+            const interval = setInterval(check, 50);
+
+            timer = window.setTimeout(() => {
+                clearInterval(interval);
+                resolve(false);
+            }, timeout);
+            
+            // Cleanup interval on success
+            const originalResolve = resolve;
+            resolve = (val) => {
+                clearInterval(interval);
+                originalResolve(val);
+            };
+        });
     }
     
     /**
@@ -251,6 +305,12 @@ export class WebSocketClient {
 
         const check = async () => {
             // Check if cache populated (by other tab via BroadcastChannel or IDB)
+            const isFocused = typeof document !== 'undefined' && document.hasFocus();
+            if(isFocused){
+                console.log(`[WS] Background polling stopped and fetched due to focus of the tab! Cache populated for ${key}`);
+                callbacks.forEach(cb => cb(key));
+                return;
+            }
             const data = await this.cacheManager.get(key);
             
             if (data) {
@@ -274,7 +334,25 @@ export class WebSocketClient {
     }
 
     private handleBroadcast(msg: WSMessage) {
-        if (msg.type === 'ws-invalidate') {
+        if (msg.type === 'ws-invalidate-all') {
+            if (!this.isLeader) {
+                console.log('[WS Follower] Received "all" invalidation from leader');
+                this.cacheManager.clear();
+                // Leader cleared DB, so we are good.
+                
+                // Trigger ALL callbacks to refetch
+                this.setRecentActivity(true);
+                setTimeout(() => this.setRecentActivity(false), 2500);
+                
+                this.globalInvalidationCallbacks.forEach(cb => cb());
+                this.callbacks.forEach((list, key) => {
+                     // Check if active or poll?
+                     // For 'all', polling is hard. We just trigger.
+                     // Active tabs will fetch. Background tabs will just have cleared cache.
+                     list.forEach(cb => cb(key));
+                });
+            }
+        } else if (msg.type === 'ws-invalidate') {
             // Non-leader tabs receive invalidation from leader
             // DON'T invalidate cache here - leader already cached fresh data
             // Just trigger callbacks to refetch (will hit cache)
@@ -632,106 +710,119 @@ export class WebSocketClient {
     }
 
     private async handleMessage(msg: any) {
+        if (this.config.handleMessage) {
+            const ctx: WebSocketContext = {
+                db: this.db,
+                cache: this.cacheManager,
+                broadcast: (message: any) => {
+                    this.channel?.postMessage(message);
+                },
+                triggerSubscribers: (key: string) => {
+                    const callbacks = this.callbacks.get(key) || [];
+                    callbacks.forEach(cb => cb(key));
+                },
+                pollSubscribers: (key: string) => {
+                    const callbacks = this.callbacks.get(key) || [];
+                    this.pollForCache(key, callbacks);
+                },
+                routeToCacheKey: this.config.routeToCacheKey || ((p) => p)
+            };
+            await this.config.handleMessage(msg, ctx, (m) => this.defaultMessageHandler(m || msg));
+        } else {
+            await this.defaultMessageHandler(msg);
+        }
+    }
+
+    private async defaultMessageHandler(msg: any) {
         // Default route mapper if not provided
         const routePathToCacheKey = this.config.routeToCacheKey || ((routePath: string) => routePath);
         
-        // Initial sync message
-        const routeKeys = Object.keys(msg).filter(k => k.startsWith('/'));
-        if (routeKeys.length > 1) {
-            console.log('[WS Leader] Received timestamp sync from server');
-            
-            const localTimestamps = await this.db.getAllTimestamps();
-            
-            let newerCount = 0;
-            let totalCount = 0;
-            
-            for (const [route, serverTimestamp] of Object.entries(msg)) {
-                if (!route.startsWith('/')) continue;
-                totalCount++;
-                
-                const localTimestamp = localTimestamps[route];
-                const serverTs = serverTimestamp as number;
-                
-                if (!localTimestamp || serverTs > localTimestamp) {
-                    newerCount++;
+        // 1. Handle New Format: { type: 'invalidate', data: { key: timestamp, ... } }
+        if (msg.type === 'invalidate' && typeof msg.data === 'object' && !Array.isArray(msg.data)) {
+            const data = msg.data as Record<string, number>;
+            const keys = Object.keys(data);
+
+            // Check for "all" - Full Cache Clear
+            if (keys.includes('all')) {
+                const timestamp = data['all'];
+                let shouldClearAll = true;
+
+                if (this.config.shouldInvalidate) {
+                     shouldClearAll = await this.config.shouldInvalidate('all', timestamp, this.db);
+                }
+
+                if (shouldClearAll) {
+                    console.log('[WS Leader] Received "all" invalidation - clearing entire cache');
+                    this.cacheManager.clear();
+                    await this.db.clearAll();
+                    
+                    // Broadcast to followers
+                    this.channel?.postMessage({ type: 'ws-invalidate-all', timestamp } as WSMessage);
+                    
+                    // Trigger ALL callbacks
+                    this.globalInvalidationCallbacks.forEach(cb => cb());
+                    this.callbacks.forEach((list, key) => {
+                         list.forEach(cb => cb(key));
+                    });
+                    
+                    this.setIsCacheEnabled(true);
+                    return;
+                } else {
+                     console.log('[WS Leader] Ignoring "all" invalidation based on user config');
                 }
             }
-            
-            if (totalCount > 0 && newerCount === totalCount && Object.keys(localTimestamps).length > 0) {
-                console.log('[WS Leader] Server restart detected - all routes have newer timestamps');
-                this.cacheManager.clear();
-                await this.db.clearAll();
-                
-                this.globalInvalidationCallbacks.forEach(cb => cb());
-            } else {
-                for (const [route, serverTimestamp] of Object.entries(msg)) {
-                    if (!route.startsWith('/')) continue;
+
+            // Handle specific keys
+            for (const [key, timestamp] of Object.entries(data)) {
+                let shouldUpdate = true;
+
+                if (this.config.shouldInvalidate) {
+                     shouldUpdate = await this.config.shouldInvalidate(key, timestamp, this.db);
+                } else {
+                    // Default behavior: Check local timestamp to see if this is actually new
+                    const localTimestamp = await this.db.getTimestamp(key);
                     
-                    const localTimestamp = localTimestamps[route];
-                    const serverTs = serverTimestamp as number;
-                    
-                    if (!localTimestamp || serverTs > localTimestamp) {
-                        console.log(`[WS Leader] Route ${route} is stale (local: ${localTimestamp}, server: ${serverTs})`);
-                        
-                        const cacheKey = routePathToCacheKey(route);
-                        this.cacheManager.invalidate(cacheKey);
-                        
-                        const callbacks = this.callbacks.get(cacheKey) || [];
-                        callbacks.forEach(cb => cb(cacheKey));
+                    if (localTimestamp && localTimestamp >= timestamp) {
+                        console.log(`[WS Leader] Ignoring stale invalidation for ${key} (Server: ${timestamp}, Local: ${localTimestamp})`);
+                        shouldUpdate = false;
                     }
                 }
+
+                if (!shouldUpdate) {
+                    continue;
+                }
+
+                console.log(`[WS Leader] Invalidation received for: ${key} at ${timestamp}`);
+                
+                // Note: We do NOT update the local timestamp here anymore.
+                // The timestamp in DB represents the "fetch time" of the current data.
+                // We only invalidate if Server Timestamp > Fetch Timestamp.
+                // If we fetch new data later, the fetch logic will update the timestamp.
+
+                const cacheKey = routePathToCacheKey(key);
+                this.cacheManager.invalidate(cacheKey);
+                
+                // Broadcast to followers IMMEDIATELY
+                console.log(`[WS Leader] Broadcasting update to followers: ${cacheKey}`);
+                this.channel?.postMessage({ type: 'ws-invalidate', key: cacheKey, timestamp } as WSMessage);
+
+                const callbacks = this.callbacks.get(cacheKey) || [];
+                
+                // Check if we are the focused tab
+                const isFocused = typeof document !== 'undefined' && document.hasFocus();
+
+                if (isFocused) {
+                    // We are active - Refetch immediately
+                    console.log(`[WS Leader] Active tab - triggering ${callbacks.length} callbacks immediately`);
+                    callbacks.forEach(cb => cb(cacheKey));
+                } else {
+                    // We are background - Poll for cache update from active tab
+                    this.pollForCache(cacheKey, callbacks);
+                }
             }
-            
-            await this.db.setTimestamps(msg);
-            this.setIsCacheEnabled(true);
             
             this.setRecentActivity(true);
             setTimeout(() => this.setRecentActivity(false), 2500);
-            
-            return;
-        }
-        
-        // Delta update message
-        const routes = Object.keys(msg);
-        if (routes.length > 0 && routes[0].startsWith('/')) {
-            const routePath = routes[0];
-            const timestamp = msg[routePath];
-            
-            console.log(`[WS Leader] Route update: ${routePath} at ${timestamp}`);
-            
-            const cacheKey = routePathToCacheKey(routePath);
-            console.log(`[WS Leader] Invalidating cache for ${cacheKey}`);
-            this.cacheManager.invalidate(cacheKey);
-            
-            await this.db.setTimestamp(routePath, timestamp);
-            
-            this.setRecentActivity(true);
-            setTimeout(() => this.setRecentActivity(false), 2500);
-            
-            // Smart Refetch Logic:
-            // 1. Broadcast immediately so active followers can update ASAP
-            // 2. Only fetch locally immediately if we are the active tab
-            // 3. If background, wait to see if active tab updates cache first
-
-            // Broadcast to followers IMMEDIATELY
-            console.log(`[WS Leader] Broadcasting update to followers: ${cacheKey}`);
-            this.channel?.postMessage({ type: 'ws-invalidate', key: cacheKey } as WSMessage);
-
-            const callbacks = this.callbacks.get(cacheKey) || [];
-            
-            // Check if we are the focused tab
-            const isFocused = typeof document !== 'undefined' && document.hasFocus();
-
-            if (isFocused) {
-                // We are active - Refetch immediately
-                console.log(`[WS Leader] Active tab - triggering ${callbacks.length} callbacks immediately`);
-                callbacks.forEach(cb => cb(cacheKey));
-            } else {
-                // We are background - Wait for active tab (follower) to potentially fetch and sync cache
-                // Poll for cache update from active tab
-                this.pollForCache(cacheKey, callbacks);
-            }
-            
             return;
         }
         

@@ -27,5 +27,6 @@
       "pro_cache": ["../../pro_cache/src/index.ts"]
     }
   },
-  "include": ["src"]
+  "include": ["src", "../../pro_cache/src"],
+  "exclude": ["../../pro_cache/src/usage_example.ts"]
 }
