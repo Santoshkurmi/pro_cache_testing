@@ -32,7 +32,7 @@ export const TodoDetail: React.FC<TodoDetailProps> = ({ id, onBack }) => {
         if (!editTitle) return;
         await axios.put(`${API_URL}/todos/${id}`, { title: editTitle });
         setEditTitle('');
-        refetch({ force: true }); // Optimistic or manual refetch with bypass
+        refetch({ force: false }); // Optimistic or manual refetch with bypass
     };
 
     if (loading) return <div>Loading Detail...</div>;

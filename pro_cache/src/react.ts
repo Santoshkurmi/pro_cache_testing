@@ -12,11 +12,15 @@ export interface LiveFetchOptions {
     query?: Record<string, string | number>;
 }
 
+export interface RefetchOptions {
+    force?: boolean;  // If true, bypass cache on read but still write to cache
+}
+
 export interface LiveFetchResult<T> {
     data: T | undefined;
     loading: boolean;
     error: any;
-    refetch: () => Promise<void>;
+    refetch: (options?: RefetchOptions) => Promise<void>;
     isRefetching: boolean;      // True when a background update is in progress
     isRefetchNeeded: boolean;   // True when invalidated but not auto-fetched
 }
@@ -26,6 +30,7 @@ export interface ProCacheStatus {
     recentActivity: boolean;
     isLeaderTab: boolean;
     isOnline: boolean;
+    isCacheEnabled: boolean;
 }
 
 // Context for ProCache Client
@@ -44,6 +49,36 @@ export const useProCache = () => {
 };
 
 /**
+ * Hook to toggle caching at runtime.
+ * Only works if `enabled: true` in config. If `enabled: false`, caching cannot be toggled.
+ * 
+ * @returns { enable, disable, toggle, isConfigEnabled }
+ */
+export function useToggleCaching() {
+    const client = useProCache();
+    
+    const enable = useCallback(async () => {
+        await client.setEnabled(true);
+    }, [client]);
+    
+    const disable = useCallback(async () => {
+        await client.setEnabled(false);
+    }, [client]);
+    
+    const toggle = useCallback(async () => {
+        const currentlyEnabled = client.socket.isCacheEnabled();
+        await client.setEnabled(!currentlyEnabled);
+    }, [client]);
+    
+    return {
+        enable,
+        disable,
+        toggle,
+        isConfigEnabled: client.isEnabled() // True if config.enabled !== false
+    };
+}
+
+/**
  * React Hook to access ProCache socket status and metadata
  */
 export function useProCacheStatus(): ProCacheStatus {
@@ -52,7 +87,8 @@ export function useProCacheStatus(): ProCacheStatus {
         wsStatus: 'disconnected',
         recentActivity: false,
         isLeaderTab: false,
-        isOnline: true
+        isOnline: true,
+        isCacheEnabled: false
     });
 
     useEffect(() => {
@@ -67,12 +103,14 @@ export function useProCacheStatus(): ProCacheStatus {
                 const recentActivity = client.socket.recentActivity();
                 const isLeaderTab = client.socket.isLeaderTab();
                 const isOnline = client.socket.isOnline();
+                const isCacheEnabled = client.socket.isCacheEnabled();
 
                 setStatus({
                     wsStatus,
                     recentActivity,
                     isLeaderTab,
-                    isOnline
+                    isOnline,
+                    isCacheEnabled
                 });
             });
         });
@@ -121,7 +159,7 @@ export function useLiveFetch<T>(
     // Resolve autoRefetch: Option > Config > Default (false)
     const shouldAutoRefetch = options?.autoRefetch ?? client.config.autoRefetchOnInvalidation ?? false;
 
-    const fetchData = useCallback(async (isRefetch = false) => {
+    const fetchData = useCallback(async (isRefetch = false, force = false) => {
         const currentVersion = versionRef.current;
         if (!isRefetch) {
             setLoading(true);
@@ -135,7 +173,8 @@ export function useLiveFetch<T>(
                 source, 
                 options?.params, 
                 options?.query, 
-                options?.cacheKey
+                options?.cacheKey,
+                force  // Pass force to client.fetch to bypass cache read
             );
             
             if (versionRef.current === currentVersion) {
@@ -162,26 +201,36 @@ export function useLiveFetch<T>(
 
         // Subscription Logic
         const path = typeof source === 'string' ? source : source.path;
-        // Logic: We subscribe to the SPECIFIC KEY for this instance data refetching.
+        // Subscribe to the SPECIFIC KEY for this instance data refetching.
         const url = client.buildPath(path, options?.params, options?.query);
-        const key = options?.cacheKey || url;
+        const specificKey = options?.cacheKey || url;
+        // Also subscribe to the BUCKET/PATTERN key (e.g., "/todos/{id}")
+        const bucketKey = path;
 
-        console.log(`[useLiveFetch] Subscribing to key: ${key}`);
-        const unsubscribe = client.socket.onInvalidate(key, () => {
-             console.log(`[useLiveFetch] Invalidation received for key: ${key}`);
-             
-             if (shouldAutoRefetch) {
-                 console.log(`[useLiveFetch] Auto-refetching...`);
-                 fetchData(true); // Refetch silently
-             } else {
-                 console.log(`[useLiveFetch] Marked as needed (autoRefetch disabled).`);
-                 setIsRefetchNeeded(true);
-             }
-        });
+        client.log(`[useLiveFetch] Subscribing to key: ${specificKey} and bucket: ${bucketKey}`);
+        
+        const handleInvalidation = () => {
+            client.log(`[useLiveFetch] Invalidation received for key: ${specificKey} or bucket: ${bucketKey}`);
+            
+            if (shouldAutoRefetch) {
+                client.log(`[useLiveFetch] Auto-refetching...`);
+                fetchData(true); // Refetch silently
+            } else {
+                client.log(`[useLiveFetch] Marked as needed (autoRefetch disabled).`);
+                setIsRefetchNeeded(true);
+            }
+        };
+        
+        // Subscribe to both specific key and bucket pattern
+        const unsubscribeSpecific = client.socket.onInvalidate(specificKey, handleInvalidation);
+        const unsubscribeBucket = specificKey !== bucketKey 
+            ? client.socket.onInvalidate(bucketKey, handleInvalidation) 
+            : () => {};
 
         return () => {
-            console.log(`[useLiveFetch] Unsubscribing from key: ${key}`);
-            unsubscribe();
+            client.log(`[useLiveFetch] Unsubscribing from key: ${specificKey} and bucket: ${bucketKey}`);
+            unsubscribeSpecific();
+            unsubscribeBucket();
         };
     }, [fetchData, client, source, JSON.stringify(options?.params), JSON.stringify(options?.query), options?.cacheKey, shouldAutoRefetch]);
 
@@ -189,7 +238,7 @@ export function useLiveFetch<T>(
         data, 
         loading, 
         error, 
-        refetch: () => fetchData(true),
+        refetch: (refetchOptions?: RefetchOptions) => fetchData(true, refetchOptions?.force ?? false),
         isRefetching,
         isRefetchNeeded
     };

@@ -11,6 +11,7 @@ const WS_URL = `ws://${window.location.hostname}:8080/ws`;
 
 export const cache = createProCache({ 
     debug: true,
+    enabled:true,
     autoRefetchOnInvalidation: false,
     cacheWritesOffline: true, // Enable offline writing
      db: {
@@ -28,6 +29,7 @@ export const cache = createProCache({
     ws: {
         url: () => `${WS_URL}?token=${currentToken}`,
         routeToCacheKey: (routePath: string) => routePath,
+        activityIndicatorDuration: 1000,
         startup: {
             enableCacheBeforeSocket: false, // Don't serve stale data on boot
             waitForSocket: true,            // Wait for socket to connect
@@ -36,20 +38,20 @@ export const cache = createProCache({
         defaultBackgroundDelay: 1000,
         backgroundPollInterval: 200,
         shouldInvalidate: async (key, value, db) => {
-            console.log(`[App] Checking invalidation for ${key}`, value);
+            if (cache.config.debug) console.log(`[App] Checking invalidation for ${key}`, value);
             if (key === 'all') {
-                 console.log('[App] Full cache clear requested');
+                 if (cache.config.debug) console.log('[App] Full cache clear requested');
                  return true; 
             }
             const localTs = await db.getTimestamp(key);
             if (localTs && localTs >= value) {
-                console.log(`[App] Ignoring stale data for ${key}`);
+                if (cache.config.debug) console.log(`[App] Ignoring stale data for ${key}`);
                 return false;
             }
             return true;
         },
         handleMessage: async (msg, ctx, defaultHandler) => {
-             console.log('[App] Custom Message Middleware:', msg);
+             ctx.log('[App] Custom Message Middleware:', msg);
 
              // Handle maintenance mode
              if (msg.type === 'server-maintenance') {
@@ -66,10 +68,11 @@ export const cache = createProCache({
                  if (msg.type === 'invalidate') {
                      const keys = Object.keys(data);
                      if (keys.length === 0) {
-                         console.log('[App] Manual: Full Sync - Empty Data (Server Restart) -> Clearing ALL');
+                         ctx.log('[App] Manual: Full Sync - Empty Data (Server Restart) -> Clearing ALL');
                          ctx.cache.clear();
                          await ctx.db.clearAll();
                          ctx.broadcast({ type: 'ws-invalidate-all', timestamp: Date.now() });
+                         ctx.enableCache(); // Enable cache after sync
                          return;
                      }
                      
@@ -84,12 +87,13 @@ export const cache = createProCache({
                          } else {
                              // If Stale or Missing locally, we don't add it to validCacheKeys.
                              // invalidateExcept will wipe it out.
-                             console.log(`[App] Manual: Stale data detected for ${key} - will be cleared by sync`);
+                             ctx.log(`[App] Manual: Stale data detected for ${key} - will be cleared by sync`);
                          }
                      }
 
-                     console.log('[App] Manual: Full Sync - Keeping valid keys, clearing others (Stale + Missing)');
+                     ctx.log('[App] Manual: Full Sync - Keeping valid keys, clearing others (Stale + Missing)');
                      await ctx.invalidateExcept(validCacheKeys);
+                     ctx.enableCache(); // Enable cache after sync
                      return;
                  }
 
@@ -98,20 +102,20 @@ export const cache = createProCache({
                      const localTs = await ctx.db.getTimestamp(key);
                      
                      if (localTs && localTs >= timestamp) {
-                         console.log(`[App] Manual: Ignoring stale ${key}`);
+                         ctx.log(`[App] Manual: Ignoring stale ${key}`);
                          continue;
                      }
                      
                      const cacheKey = ctx.routeToCacheKey(key);
-                     console.log(`[App] Manual: Invalidating ${cacheKey} (from ${key})`);
+                     ctx.log(`[App] Manual: Invalidating ${cacheKey} (from ${key})`);
                      ctx.cache.invalidate(cacheKey);
                      ctx.broadcast({ type: 'ws-invalidate', key: cacheKey, timestamp });
                      
                     if (document.hasFocus()) {
-                         console.log(`[App] Manual: Active tab - triggering subscribers immediately`,cacheKey);
+                         ctx.log(`[App] Manual: Active tab - triggering subscribers immediately`, cacheKey);
                          ctx.triggerSubscribers(cacheKey);
                      } else {
-                         console.log(`[App] Manual: Background tab - polling subscribers`);
+                         ctx.log(`[App] Manual: Background tab - polling subscribers`);
                          ctx.pollSubscribers(cacheKey);
                      }
                  }

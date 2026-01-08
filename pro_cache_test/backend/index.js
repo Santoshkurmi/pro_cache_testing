@@ -101,7 +101,7 @@ app.put('/api/todos/:id', async (req, res) => {
     if (completed !== undefined) todo.completed = completed;
     
     // Invalidate list AND detail bucket
-    await invalidate('/todos');
+    // await invalidate('/todos');
     // Invalidate the BUCKET (Route Pattern).
     // This will clear /todos/1, /todos/2, etc. because they all belong to this pattern.
     await invalidate('/todos/{id}'); 
