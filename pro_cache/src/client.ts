@@ -238,7 +238,7 @@ export class ProCacheClient {
                     
                     if (ttl && ttl > 0) {
                         // Store in Bucket: Pattern -> SpecificKey -> Data
-                        await this.cache.set(routePattern, specificKey, data, ttl);
+                        await this.cache.set(routePattern, specificKey, data, ttl, serverTimestamp);
                         this.log(`[ProCache] Cached "${specificKey}" in bucket "${routePattern}" with TTL ${ttl}s`);
                     }
                 }

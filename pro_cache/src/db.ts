@@ -6,7 +6,7 @@
 export interface CachedData {
     data: any;
     expiry: number;
-    timestamp?: number; // Route timestamp when this was cached
+    timestamp: number; // REQUIRED: Route timestamp when this was cached
 }
 
 export interface IndexedDBConfig {
@@ -81,7 +81,18 @@ export class IndexedDBCache {
             const db = await this.ensureDB();
             const tx = db.transaction(this.config.timestampStoreName!, 'readwrite');
             const store = tx.objectStore(this.config.timestampStoreName!);
-            store.put(timestamp, route);
+            
+            // Latest Wins logic
+            const currentReq = store.get(route);
+            currentReq.onsuccess = () => {
+                const current = currentReq.result as number | undefined;
+                if (current === undefined || timestamp > current) {
+                    store.put(timestamp, route);
+                } else {
+                    console.debug(`[IndexedDB] Skipping timestamp update for ${route}: incoming ${timestamp} <= existing ${current}`);
+                }
+            };
+
             await new Promise((resolve, reject) => {
                 tx.oncomplete = resolve;
                 tx.onerror = () => reject(tx.error);
@@ -175,12 +186,18 @@ export class IndexedDBCache {
             
             getReq.onsuccess = () => {
                 const bucketMap: Record<string, CachedData> = getReq.result || {};
-                bucketMap[key] = data;
-                store.put(bucketMap, bucket);
+                const existing = bucketMap[key];
+                
+                // Latest Wins logic for the specific key in bucket
+                if (!existing || data.timestamp >= existing.timestamp) {
+                    bucketMap[key] = data;
+                    store.put(bucketMap, bucket);
+                } else {
+                   console.debug(`[IndexedDB] Skipping cache update for ${key} in ${bucket}: incoming ${data.timestamp} < existing ${existing.timestamp}`);
+                }
             };
             
             getReq.onerror = () => {
-                // Fallback: just try to put new bucket
                 const bucketMap: Record<string, CachedData> = {};
                 bucketMap[key] = data;
                 store.put(bucketMap, bucket);

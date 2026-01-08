@@ -3,11 +3,12 @@ import { IndexedDBCache } from './db';
 export interface CacheItem<T = any> {
     data: T;
     expiry: number;
+    timestamp: number; // Server-side timestamp
 }
 
 // Updated Message types for Bucket Strategy
 type CacheMessage = 
-    | { type: 'cache-set', bucket: string, key: string, data: any, expiry: number }
+    | { type: 'cache-set', bucket: string, key: string, data: any, expiry: number, timestamp: number }
     | { type: 'cache-invalidate', bucket: string } // Invalidate entire bucket
     | { type: 'cache-request', requestId: string }
     | { type: 'cache-response', requestId: string, cache: Array<[string, Record<string, CacheItem>]> }; // [Bucket, MapObject]
@@ -112,7 +113,7 @@ export class CacheManager {
     private handleMessage(msg: CacheMessage) {
         if (msg.type === 'cache-set') {
             // Set cache from other tab
-            this.setLocal(msg.bucket, msg.key, { data: msg.data, expiry: msg.expiry });
+            this.setLocal(msg.bucket, msg.key, { data: msg.data, expiry: msg.expiry, timestamp: msg.timestamp });
             console.debug(`[Cache] Synced from other tab: ${msg.key} in ${msg.bucket}`);
         } else if (msg.type === 'cache-invalidate') {
             // Invalidate bucket from other tab
@@ -151,25 +152,31 @@ export class CacheManager {
 
     private setLocal(bucket: string, key: string, item: CacheItem) {
         const bucketMap = this.getBucketMap(bucket);
-        bucketMap.set(key, item);
+        const existing = bucketMap.get(key);
+        
+        if (!existing || item.timestamp >= existing.timestamp) {
+            bucketMap.set(key, item);
+        } else {
+            console.debug(`[Cache] Skipping memory update for ${key} in ${bucket}: incoming ${item.timestamp} < existing ${existing.timestamp}`);
+        }
     }
 
     /**
      * Set data in cache with a TTL (in seconds)
      */
-    async set(bucketPattern: string, specificKey: string, data: any, ttlSeconds: number, persistToIndexedDB = true) {
+    async set(bucketPattern: string, specificKey: string, data: any, ttlSeconds: number, timestamp: number, persistToIndexedDB = true) {
         if (!ttlSeconds || ttlSeconds <= 0) return;
         if (data === null || data === undefined) return;
         
         const expiry = Date.now() + (ttlSeconds * 1000);
         
         // Update Memory
-        this.setLocal(bucketPattern, specificKey, { data, expiry });
+        this.setLocal(bucketPattern, specificKey, { data, expiry, timestamp });
         this.isInitialized = true;
 
         // Persist to IndexedDB
         if (persistToIndexedDB) {
-            await this.db.setCache(bucketPattern, specificKey, { data, expiry });
+            await this.db.setCache(bucketPattern, specificKey, { data, expiry, timestamp });
         }
 
         // Broadcast to other tabs
@@ -178,7 +185,8 @@ export class CacheManager {
             bucket: bucketPattern,
             key: specificKey, 
             data, 
-            expiry 
+            expiry,
+            timestamp
         } as CacheMessage);
     }
 
@@ -193,7 +201,7 @@ export class CacheManager {
         if (!item) {
             const dbItem = await this.db.getCache(bucketPattern, specificKey);
             if (dbItem) {
-                item = { data: dbItem.data, expiry: dbItem.expiry };
+                item = dbItem; // Use the full db item including timestamp
                 // Restore to memory
                 bucketMap.set(specificKey, item);
                 console.debug(`[Cache] Restored from IndexedDB: ${specificKey}`);
