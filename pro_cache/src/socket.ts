@@ -14,7 +14,9 @@ export type WSMessage =
     | { type: 'ws-upstream', payload: any }
     | { type: 'ws-custom', payload: any }
     | { type: 'network-offline' }
-    | { type: 'network-online' };
+    | { type: 'network-online' }
+    | { type: 'ws-cache-enabled', enabled: boolean, explicitlyClosed?: boolean }
+    | { type: 'ws-debug-enabled', enabled: boolean };
 
 export interface WebSocketContext {
     db: IndexedDBCache;
@@ -57,6 +59,8 @@ export class WebSocketClient {
     public setIsOnline: Setter<boolean>;
     public isCacheEnabled: Accessor<boolean>;
     public setIsCacheEnabled: Setter<boolean>;
+    public debugStatus: Accessor<boolean>;
+    public setDebugStatus: Setter<boolean>;
 
     private ws: WebSocket | null = null;
     private reconnectAttempts = 0;
@@ -74,23 +78,40 @@ export class WebSocketClient {
     private db: IndexedDBCache;
     private config: WebSocketConfig;
     
-    // Debug flag (set from parent config)
-    private debug: boolean = false;
-    
     // Defaults
     private readonly DEFAULT_DELAY = 500;
     private readonly DEFAULT_POLL_INTERVAL = 200;
     
     // Debug-aware logging
     public log(...args: any[]) {
-        if (this.debug) {
+        if (this.debugStatus()) {
             console.log(...args);
         }
     }
     
     // Set debug mode at runtime
     public setDebug(enabled: boolean) {
-        this.debug = enabled;
+        this.setDebugStatus(enabled);
+        this.channel?.postMessage({ type: 'ws-debug-enabled', enabled } as WSMessage);
+    }
+
+    /**
+     * Update cache enabled status and broadcast to other tabs
+     */
+    public updateCacheEnabled(enabled: boolean) {
+        this.setIsCacheEnabled(enabled);
+        const prev = this.isExplicitlyClosed;
+        this.isExplicitlyClosed = !enabled;
+        
+        if (prev !== this.isExplicitlyClosed) {
+            this.log(`[WS] Explicit closure changed: ${prev} -> ${this.isExplicitlyClosed} (via updateCacheEnabled)`);
+        }
+
+        this.channel?.postMessage({ 
+            type: 'ws-cache-enabled', 
+            enabled, 
+            explicitlyClosed: this.isExplicitlyClosed 
+        } as WSMessage);
     }
 
     // Leader election
@@ -114,15 +135,14 @@ export class WebSocketClient {
         this.cacheManager = cacheManager;
         this.db = db;
         this.config = config;
-        this.debug = config.debug ?? false;
 
-        // Initialize signals
+        // 1. Initialize and assign signals FIRST so they are available for logging
         const [wsStatus, setWsStatus] = createSignal<ConnectionStatus>('disconnected');
         const [recentActivity, setRecentActivity] = createSignal(false);
         const [isLeaderTab, setIsLeaderTab] = createSignal(false);
         const [isOnline, setIsOnline] = createSignal(typeof navigator !== 'undefined' ? navigator.onLine : true);
+        const [debugStatus, setDebugStatus] = createSignal(config.debug ?? false);
         
-        // If enableCacheBeforeSocket is false, start with cache disabled until socket connects
         const initialCacheEnabled = config.startup?.enableCacheBeforeSocket !== false;
         const [isCacheEnabled, setIsCacheEnabled] = createSignal(initialCacheEnabled);
 
@@ -136,6 +156,11 @@ export class WebSocketClient {
         this.setIsOnline = setIsOnline;
         this.isCacheEnabled = isCacheEnabled;
         this.setIsCacheEnabled = setIsCacheEnabled;
+        this.debugStatus = debugStatus;
+        this.setDebugStatus = setDebugStatus;
+
+        // 2. NOW we can safely log
+        this.log(`[WS] Initializing tab ${this.tabId} (Leader-to-be if first)`);
 
         if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
             this.channel = new BroadcastChannel(config.channelName || 'pro-cache-ws-sync');
@@ -162,10 +187,13 @@ export class WebSocketClient {
     
     // Public API to start connection logic
     public async connect() {
+        this.log(`[WS] Manual connect() called - resetting isExplicitlyClosed from ${this.isExplicitlyClosed} to false`);
+        this.isExplicitlyClosed = false;
         await this.becomeLeader();
     }
 
     public disconnect() {
+        console.log("Disconnecting")
         this.isExplicitlyClosed = true;
         this.stepDown();
     }
@@ -417,6 +445,27 @@ export class WebSocketClient {
             this.setIsOnline(true);
             // Trigger global invalidation callbacks to refetch data
             this.globalInvalidationCallbacks.forEach(cb => cb());
+        } else if (msg.type === 'ws-cache-enabled') {
+            this.setIsCacheEnabled(msg.enabled);
+            if (msg.explicitlyClosed !== undefined) {
+                if (this.isExplicitlyClosed !== msg.explicitlyClosed) {
+                    this.log(`[WS] Updating isExplicitlyClosed to ${msg.explicitlyClosed} from remote message`);
+                }
+                this.isExplicitlyClosed = msg.explicitlyClosed;
+            }
+            
+            // If we are leader, ensure WebSocket status matches cache status
+            if (this.isLeader) {
+                if (msg.enabled && !this.isExplicitlyClosed) {
+                    this.log('[WS Leader] Enabling WebSocket due to remote cache-enable command');
+                    this.connectWebSocket();
+                } else if (!msg.enabled) {
+                    this.log('[WS Leader] Disconnecting WebSocket due to remote cache-disable command');
+                    this.disconnectWebSocket();
+                }
+            }
+        } else if (msg.type === 'ws-debug-enabled') {
+            this.setDebugStatus(msg.enabled);
         } else if (msg.type === 'leader-stepdown') {
             // Current leader is stepping down specifically (e.g. tab closed)
             // Instant election trigger
@@ -460,13 +509,24 @@ export class WebSocketClient {
                 this.channel?.postMessage({ type: 'leader-claim', tabId: this.tabId } as WSMessage);
                 
                 // Ensure WebSocket is connected (might have failed to connect when becoming leader)
+                // ONLY connect if not explicitly closed and caching is supposed to be ON
                 if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
-                    this.log('[WS Leader] WebSocket not connected, attempting to connect...');
-                    this.connectWebSocket();
+                    if (!this.isExplicitlyClosed && this.isCacheEnabled()) {
+                        this.log('[WS Leader] WebSocket not connected, attempting to connect...');
+                        this.connectWebSocket();
+                    } else {
+                        this.log('[WS Leader] Skipping auto-connect during leader-query: Caching disabled or explicitly closed');
+                    }
                 }
                 
                 // Broadcast current WebSocket status so follower knows connection state
                 this.channel?.postMessage({ type: 'ws-status', status: this.wsStatus() } as WSMessage);
+                this.channel?.postMessage({ 
+                    type: 'ws-cache-enabled', 
+                    enabled: this.isCacheEnabled(),
+                    explicitlyClosed: this.isExplicitlyClosed
+                } as WSMessage);
+                this.channel?.postMessage({ type: 'ws-debug-enabled', enabled: this.debugStatus() } as WSMessage);
             }
         } else if (msg.type === 'ws-upstream') {
             // Leader received message from Follower to send to server
@@ -606,6 +666,12 @@ export class WebSocketClient {
     }
 
     private connectWebSocket() {
+        // Guard: Don't connect if explicitly closed
+        if (this.isExplicitlyClosed) {
+            this.log('[WS Leader] connectWebSocket aborted: isExplicitlyClosed is true');
+            return;
+        }
+
         // Only leader should connect WebSocket
         if (!this.isLeader) {
             console.warn(`[WS] Tab ${this.tabId} tried to connect WebSocket but is not leader`);
@@ -661,7 +727,13 @@ export class WebSocketClient {
             // Disable caching on disconnect/failure to force API usage
             // We NO LONGER clear cache, so data persists for offline usage or basic persistence
             this.log('[WS Leader] Disabling cache serving due to disconnect (Persistence Active)');
+            
             this.setIsCacheEnabled(false);
+            this.channel?.postMessage({ 
+                type: 'ws-cache-enabled', 
+                enabled: false, 
+                explicitlyClosed: this.isExplicitlyClosed 
+            } as WSMessage);
             
             if (!this.isExplicitlyClosed && this.isLeader) {
                 this.scheduleReconnect();
@@ -675,7 +747,13 @@ export class WebSocketClient {
             
             // Disable caching on error to force API usage
             this.log('[WS Leader] Disabling cache serving due to error (Persistence Active)');
+            
             this.setIsCacheEnabled(false);
+            this.channel?.postMessage({ 
+                type: 'ws-cache-enabled', 
+                enabled: false, 
+                explicitlyClosed: this.isExplicitlyClosed 
+            } as WSMessage);
         };
 
         this.ws.onmessage = (event) => {
@@ -717,6 +795,16 @@ export class WebSocketClient {
     }
 
     private scheduleReconnect() {
+        // Don't reconnect if explicitly closed or caching disabled
+        if (this.isExplicitlyClosed || !this.isCacheEnabled() || !this.isLeader) {
+            this.log('[WS Leader] Skipping reconnect: status check failed', {
+                isExplicitlyClosed: this.isExplicitlyClosed,
+                cachingEnabled: this.isCacheEnabled(),
+                isLeader: this.isLeader
+            });
+            return;
+        }
+
         // Don't reconnect if offline
         if (typeof navigator !== 'undefined' && !navigator.onLine) {
             this.log('[WS Leader] Network offline, skipping reconnect');
@@ -767,8 +855,12 @@ export class WebSocketClient {
                     }
                 },
                 enableCache: () => {
+                    if (this.isExplicitlyClosed) {
+                        this.log('[WS] Custom handler tried to enable cache, but it is explicitly closed. Ignoring.');
+                        return;
+                    }
                     this.log('[WS] Custom handler enabling cache after sync');
-                    this.setIsCacheEnabled(true);
+                    this.updateCacheEnabled(true);
                 },
                 log: (...args: any[]) => this.log(...args)
             };
@@ -792,11 +884,14 @@ export class WebSocketClient {
                  this.cacheManager.clear();
                  await this.db.clearAll();
                  // Notify
-                 this.channel?.postMessage({ type: 'ws-invalidate-all', timestamp: Date.now() } as WSMessage);
-                 this.globalInvalidationCallbacks.forEach(cb => cb());
-                 this.setIsCacheEnabled(true);
-                 return;
-            }
+                  this.channel?.postMessage({ type: 'ws-invalidate-all', timestamp: Date.now() } as WSMessage);
+                  this.globalInvalidationCallbacks.forEach(cb => cb());
+                  
+                  if (!this.isExplicitlyClosed) {
+                      this.updateCacheEnabled(true);
+                  }
+                  return;
+             }
 
             // Case B: Non-Empty Data -> Sync
             // 1. Update items from Server (if newer)
@@ -830,7 +925,9 @@ export class WebSocketClient {
             
             // Enable caching after full sync is complete
             this.log('[WS Leader] Full sync complete, enabling cache');
-            this.setIsCacheEnabled(true);
+            if (!this.isExplicitlyClosed) {
+                this.updateCacheEnabled(true);
+            }
             return;
         }
 

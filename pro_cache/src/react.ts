@@ -31,6 +31,7 @@ export interface ProCacheStatus {
     isLeaderTab: boolean;
     isOnline: boolean;
     isCacheEnabled: boolean;
+    isDebugEnabled: boolean;
 }
 
 // Context for ProCache Client
@@ -88,7 +89,8 @@ export function useProCacheStatus(): ProCacheStatus {
         recentActivity: false,
         isLeaderTab: false,
         isOnline: true,
-        isCacheEnabled: false
+        isCacheEnabled: false,
+        isDebugEnabled: false
     });
 
     useEffect(() => {
@@ -104,13 +106,15 @@ export function useProCacheStatus(): ProCacheStatus {
                 const isLeaderTab = client.socket.isLeaderTab();
                 const isOnline = client.socket.isOnline();
                 const isCacheEnabled = client.socket.isCacheEnabled();
+                const isDebugEnabled = client.socket.debugStatus();
 
                 setStatus({
                     wsStatus,
                     recentActivity,
                     isLeaderTab,
                     isOnline,
-                    isCacheEnabled
+                    isCacheEnabled,
+                    isDebugEnabled
                 });
             });
         });

@@ -1,10 +1,8 @@
 use actix_web::{web, Error, HttpRequest, HttpResponse};
-// use actix_ws::AggregatedMessage;
-use futures_util::{future, StreamExt as _};
+use futures_util::StreamExt as _;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 use crate::state::{AppState, SessionData};
-use std::time::Instant;
 
 pub async fn ws_handler(
     req: HttpRequest,
@@ -21,41 +19,25 @@ pub async fn ws_handler(
     };
 
     // 2. Validate Token
-    // We check if it exists in pending_tokens
-    let token_data_opt = if let Some(entry) = data.pending_tokens.get(&token) {
-        // Check TTL (if we wanted to enforce strictly, but for now just existence)
-        Some(entry.clone())
-    } else {
-        None
-    };
-
-    let token_data = match token_data_opt {
-        Some(t) => t,
+    let token_data = match data.pending_tokens.get(&token) {
+        Some(entry) => entry.clone(),
         None => return Ok(HttpResponse::Unauthorized().body("Invalid or expired token")),
     };
 
-    // Remove token from pending once used? 
-    // User Update: "token is not one time, it will be for as long as it not chaneg again"
-    // So we DO NOT remove it. 
-    // data.pending_tokens.remove(&token);
-
     // 3. Upgrade to WebSocket
     let (res, mut session, mut stream) = actix_ws::handle(&req, stream)?;
-    // Simple stream handling without explicit continuation aggregation for now
-    // as it simplifies the verification step.
 
     let project_id = token_data.project_id.clone();
     let user_id = token_data.user_id.clone();
     let session_id = Uuid::new_v4();
 
-    // 5. Send Initial Invalidation State (Full Sync)
-    // We send a map of { route_path: timestamp }
-    // If empty (server restart), client will see empty map and clear its local cache (Sync).
-    let initial_routes: std::collections::HashMap<String, i64> = if let Some(proj_map) = data.project_invalidation_state.get(&project_id) {
-        proj_map.iter().map(|r| (r.key().clone(), *r.value())).collect()
-    } else {
-        std::collections::HashMap::new()
-    };
+    // 4. Send Initial Invalidation State
+    let initial_routes: std::collections::HashMap<String, i64> = 
+        if let Some(proj_map) = data.project_invalidation_state.get(&project_id) {
+            proj_map.iter().map(|r| (r.key().clone(), *r.value())).collect()
+        } else {
+            std::collections::HashMap::new()
+        };
 
     let all_sync = serde_json::json!({
         "type": "invalidate",
@@ -64,10 +46,9 @@ pub async fn ws_handler(
     let _ = session.text(all_sync.to_string()).await;
 
     // 5. Create Channel for this session
-    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let (tx, rx) = mpsc::unbounded_channel::<String>();
 
-    // 6. Register Session using DashMap
-    // Ensure the inner map exists
+    // 6. Register Session
     data.active_sessions
         .entry(project_id.clone())
         .or_insert_with(dashmap::DashMap::new)
@@ -79,40 +60,52 @@ pub async fn ws_handler(
     let active_sessions = data.active_sessions.clone();
     let project_id_clone = project_id.clone();
 
-    // 6. Spawn Actor/Task to handle the socket
+    // 7. Spawn WebSocket Task
     actix_rt::spawn(async move {
-        // Send initial connection success message or similar if needed? 
-        // For pro_cache, it might expect a status message.
-        // session.text(serde_json::json!({ "type": "ws-status", "status": "connected" }).to_string()).await.unwrap();
-
-        // Main Loop
         let mut rx_stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx);
         
+        // We keep track of the close reason if the client sends one
+        let mut close_reason = None;
+
         loop {
             tokio::select! {
-                // Handle Incoming WebSocket Messages (from Client)
+                // Incoming messages from the Client
                 msg_opt = stream.next() => {
                     match msg_opt {
-                        Some(Ok(actix_ws::Message::Close(_))) => break,
-                        Some(Ok(_)) => {}, 
+                        Some(Ok(actix_ws::Message::Ping(bytes))) => {
+                            if session.pong(&bytes).await.is_err() { break; }
+                        }
+                        Some(Ok(actix_ws::Message::Close(reason))) => {
+                            close_reason = reason;
+                            break; // Exit loop to handle session.close() once
+                        }
                         Some(Err(_)) | None => break,
+                        _ => {}
                     }
                 }
 
-                // Handle Outgoing Messages (from Internal API -> Channel -> Client)
-                Some(msg) = rx_stream.next() => {
-                    if session.text(msg).await.is_err() {
-                        break;
+                // Outgoing messages from Internal API
+                msg_from_chan = rx_stream.next() => {
+                    match msg_from_chan {
+                        Some(msg) => {
+                            if session.text(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
                     }
                 }
             }
         }
 
-        // Cleanup
+        // --- CLEANUP PHASE ---
+        
+        // This consumes `session`. Since we are outside the loop, 
+        // it only happens once.
+        let _ = session.close(close_reason).await;
+
         if let Some(project_map) = active_sessions.get(&project_id_clone) {
             project_map.remove(&session_id);
-            // If empty, we could remove the project map too, but DashMap inner deletion concurrency is tricky
-            // Leaving empty map is fine for now.
         }
     });
 

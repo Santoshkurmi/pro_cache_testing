@@ -7,10 +7,9 @@ import { cache, setCacheToken } from './cache';
 const API_URL = `http://${window.location.hostname}:3001/api`;
 
 function App() {
-  const { wsStatus, isOnline, recentActivity, isLeaderTab, isCacheEnabled } = useProCacheStatus();
+  const { wsStatus, isOnline, recentActivity, isLeaderTab, isCacheEnabled, isDebugEnabled } = useProCacheStatus();
   const { toggle: toggleCache, isConfigEnabled } = useToggleCaching();
   const client = useProCache();
-  const [debugMode, setDebugMode] = useState(client.config.debug ?? false);
   
   // Keyboard shortcuts: Ctrl+K = toggle cache, Ctrl+Shift+D = toggle debug
   useEffect(() => {
@@ -21,19 +20,18 @@ function App() {
       }
       if (e.ctrlKey && e.shiftKey && e.key === 'D') {
         e.preventDefault();
-        const newDebug = !debugMode;
+        const newDebug = !isDebugEnabled;
         client.config.debug = newDebug;
-        client.socket.setDebug?.(newDebug);
-        setDebugMode(newDebug);
+        client.socket.setDebug(newDebug);
         console.log(`[ProCache] Debug mode: ${newDebug ? 'ON' : 'OFF'}`);
       }
     };
     window.addEventListener('keydown', handler);
     return () => window.removeEventListener('keydown', handler);
-  }, [toggleCache, debugMode, client]);
+  }, [toggleCache, isDebugEnabled, client]);
   
   useGlobalInvalidation(() => {
-    alert('Global cache invalidation received! Refreshing all data...');
+    console.log('Global cache invalidation received! Refreshing all data...');
   });
 
   const [userId, setUserId] = useState(localStorage.getItem('userId'));
@@ -219,7 +217,7 @@ function App() {
               </>
           )}
           <span>|</span>
-          <span>Debug: <b style={{ color: debugMode ? '#22c55e' : '#6b7280' }}>{debugMode ? 'ON' : 'OFF'}</b></span>
+          <span>Debug: <b style={{ color: isDebugEnabled ? '#22c55e' : '#6b7280' }}>{isDebugEnabled ? 'ON' : 'OFF'}</b></span>
           <span style={{ marginLeft: 'auto', color: '#6b7280', fontSize: 10 }}>
               (Ctrl+K: Toggle Cache | Ctrl+Shift+D: Toggle Debug)
           </span>

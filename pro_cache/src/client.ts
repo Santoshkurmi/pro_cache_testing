@@ -88,11 +88,12 @@ export class ProCacheClient {
         
         if (enabled) {
             this.log('[ProCache] Runtime enabling caching and socket');
+            this.socket.updateCacheEnabled(true);
             await this.socket.connect();
         } else {
             this.log('[ProCache] Runtime disabling caching and socket');
             this.socket.disconnect();
-            this.socket.setIsCacheEnabled(false);
+            this.socket.updateCacheEnabled(false);
         }
     }
     
