@@ -1,7 +1,7 @@
 {
-  "name": "pro_cache",
+  "name": "@santoshkurmi/pro_cache",
   "version": "1.0.0",
-  "description": "A powerful caching and socket synchronization library for SolidJS",
+  "description": "High-performance reactive caching and WebSocket synchronization library for React & SolidJS",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",

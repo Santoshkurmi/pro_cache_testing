@@ -193,7 +193,7 @@ export class WebSocketClient {
     }
 
     public disconnect() {
-        console.log("Disconnecting")
+        this.log('[WS] Manual disconnect called');
         this.isExplicitlyClosed = true;
         this.stepDown();
     }
