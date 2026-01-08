@@ -11,7 +11,7 @@ const WS_URL = `ws://${window.location.hostname}:8080/ws`;
 
 export const cache = createProCache({ 
     debug: true,
-    enabled:true,
+    enabled:localStorage.getItem('pro_cache_enabled') != 'false',
     autoRefetchOnInvalidation: false,
     cacheWritesOffline: true, // Enable offline writing
      db: {
@@ -60,15 +60,28 @@ export const cache = createProCache({
              }
 
              // 2. Manual Invalidation Handling (Sync/Delta)
-             // User explicitly wants to demonstrate/override this logic here.
              if (msg.type === 'invalidate' || msg.type === 'invalidate-delta') {
                  const data = msg.data as Record<string, number>;
                  
                  // A) Full Sync Logic (type: 'invalidate')
                  if (msg.type === 'invalidate') {
+                     // Check for Clock Drift / Server State Reset
+                     const driftTime = msg.drift_time;
+                     const storedDrift = localStorage.getItem('pro_cache_drift_time');
+
+                     if (driftTime && String(driftTime) !== storedDrift) {
+                         ctx.log(`[App] Manual: Clock Drift detected (${storedDrift} -> ${driftTime}). Clearing ALL.`);
+                         localStorage.setItem('pro_cache_drift_time', String(driftTime));
+                         ctx.cache.clear();
+                         await ctx.db.clearAll();
+                         ctx.broadcast({ type: 'ws-invalidate-all', timestamp: Date.now() });
+                         ctx.enableCache();
+                         return;
+                     }
+
                      const keys = Object.keys(data);
                      if (keys.length === 0) {
-                         ctx.log('[App] Manual: Full Sync - Empty Data (Server Restart) -> Clearing ALL');
+                         ctx.log('[App] Manual: Full Sync - Empty Data -> Clearing ALL');
                          ctx.cache.clear();
                          await ctx.db.clearAll();
                          ctx.broadcast({ type: 'ws-invalidate-all', timestamp: Date.now() });

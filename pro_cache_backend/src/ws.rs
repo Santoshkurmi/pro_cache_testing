@@ -32,16 +32,27 @@ pub async fn ws_handler(
     let session_id = Uuid::new_v4();
 
     // 4. Send Initial Invalidation State
+    let timestamp_now = chrono::Utc::now().timestamp_millis();
+    let proj_map = data.project_invalidation_state.entry(project_id.clone())
+        .or_insert_with(dashmap::DashMap::new);
+
+    // If this project has no invalidation state yet, but we have globally known routes 
+    // (e.g. from routes.json after a restart), populate the project state with "now" timestamps.
+    // This forces the frontend to invalidate its local cache for these routes once.
+    if proj_map.is_empty() && !data.known_routes.is_empty() {
+        log::info!("[WS] Populating initial state for project {} with {} known routes", project_id, data.known_routes.len());
+        for entry in data.known_routes.iter() {
+            proj_map.insert(entry.key().clone(), timestamp_now);
+        }
+    }
+
     let initial_routes: std::collections::HashMap<String, i64> = 
-        if let Some(proj_map) = data.project_invalidation_state.get(&project_id) {
-            proj_map.iter().map(|r| (r.key().clone(), *r.value())).collect()
-        } else {
-            std::collections::HashMap::new()
-        };
+        proj_map.iter().map(|r| (r.key().clone(), *r.value())).collect();
 
     let all_sync = serde_json::json!({
         "type": "invalidate",
-        "data": initial_routes
+        "data": initial_routes,
+        "drift_time": data.last_drift_timestamp.load(std::sync::atomic::Ordering::SeqCst)
     });
     let _ = session.text(all_sync.to_string()).await;
 

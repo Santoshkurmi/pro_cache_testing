@@ -6,9 +6,8 @@ import { ProCacheProvider } from '../../../pro_cache/src/react'
 import { cache } from './cache'
 
 createRoot(document.getElementById('root')!).render(
-  <StrictMode>
+  // <StrictMode>
     <ProCacheProvider client={cache}>
         <App />
     </ProCacheProvider>
-  </StrictMode>,
 )

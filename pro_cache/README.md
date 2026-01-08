@@ -37,33 +37,57 @@ The `createProCache` function allows full control over how your app handles data
 ```typescript
 import { createProCache } from 'pro_cache';
 
-export const cache = createProCache({
+let currentToken = '';
+
+export const setCacheToken = (token: string) => {
+    currentToken = token;
+};
+
+const apiBase = `http://${window.location.hostname}:3001/api`;
+const WS_URL = `ws://${window.location.hostname}:8080/ws`;
+
+export const cache = createProCache({ 
     debug: true,
-    enabled: true,
-    autoRefetchOnInvalidation: false, // Recommended: manual control
-    db: {
-        dbName: 'my_app_cache',
+    enabled:localStorage.getItem('pro_cache_enabled') != 'false',
+    autoRefetchOnInvalidation: false,
+    cacheWritesOffline: true, // Enable offline writing
+     db: {
+        dbName: 'finance_pro_cache',
         dbVersion: 1
-    },
+    }, 
     api: {
-        baseUrl: 'https://api.myapp.com/api',
+        baseUrl: apiBase,
         defaultCacheTtl: 600
     },
     getTimestamp: (response) => {
-        // CRITICAL: Extract server time to stay sync-safe
-        return response.headers['x-server-timestamp'] || Date.now();
+        const serverTs = response.headers?.['x-server-timestamp'];
+        return serverTs ? parseInt(serverTs, 10) : Date.now();
     },
     ws: {
-        url: () => `ws://sock.myapp.com?token=${currentToken}`,
-        
-        // 1. Map route patterns to cache buckets
-        routeToCacheKey: (routePath) => {
-            // e.g., turn "/todos/123" into "/todos/{id}" for bucket invalidation
-            return routePath.replace(/\/todos\/\d+/, '/todos/{id}');
+        url: () => `${WS_URL}?token=${currentToken}`,
+        routeToCacheKey: (routePath: string) => routePath,
+        activityIndicatorDuration: 1000,
+        startup: {
+            enableCacheBeforeSocket: false, // Don't serve stale data on boot
+            waitForSocket: true,            // Wait for socket to connect
+            socketWaitTimeout: 3000         // 3s timeout
         },
-
-        // 2. Custom Message Middleware
-         handleMessage: async (msg, ctx, defaultHandler) => {
+        defaultBackgroundDelay: 1000,
+        backgroundPollInterval: 200,
+        shouldInvalidate: async (key, value, db) => {
+            if (cache.config.debug) console.log(`[App] Checking invalidation for ${key}`, value);
+            if (key === 'all') {
+                 if (cache.config.debug) console.log('[App] Full cache clear requested');
+                 return true; 
+            }
+            const localTs = await db.getTimestamp(key);
+            if (localTs && localTs >= value) {
+                if (cache.config.debug) console.log(`[App] Ignoring stale data for ${key}`);
+                return false;
+            }
+            return true;
+        },
+        handleMessage: async (msg, ctx, defaultHandler) => {
              ctx.log('[App] Custom Message Middleware:', msg);
 
              // Handle maintenance mode
@@ -73,15 +97,28 @@ export const cache = createProCache({
              }
 
              // 2. Manual Invalidation Handling (Sync/Delta)
-             // User explicitly wants to demonstrate/override this logic here.
              if (msg.type === 'invalidate' || msg.type === 'invalidate-delta') {
                  const data = msg.data as Record<string, number>;
                  
                  // A) Full Sync Logic (type: 'invalidate')
                  if (msg.type === 'invalidate') {
+                     // Check for Clock Drift / Server State Reset
+                     const driftTime = msg.drift_time;
+                     const storedDrift = localStorage.getItem('pro_cache_drift_time');
+
+                     if (driftTime && String(driftTime) !== storedDrift) {
+                         ctx.log(`[App] Manual: Clock Drift detected (${storedDrift} -> ${driftTime}). Clearing ALL.`);
+                         localStorage.setItem('pro_cache_drift_time', String(driftTime));
+                         ctx.cache.clear();
+                         await ctx.db.clearAll();
+                         ctx.broadcast({ type: 'ws-invalidate-all', timestamp: Date.now() });
+                         ctx.enableCache();
+                         return;
+                     }
+
                      const keys = Object.keys(data);
                      if (keys.length === 0) {
-                         ctx.log('[App] Manual: Full Sync - Empty Data (Server Restart) -> Clearing ALL');
+                         ctx.log('[App] Manual: Full Sync - Empty Data -> Clearing ALL');
                          ctx.cache.clear();
                          await ctx.db.clearAll();
                          ctx.broadcast({ type: 'ws-invalidate-all', timestamp: Date.now() });
@@ -139,16 +176,14 @@ export const cache = createProCache({
              if (defaultHandler) {
                  await defaultHandler(msg);
              }
-        },
-
-        // 3. Custom invalidation filter
-        shouldInvalidate: async (key, value, db) => {
-            const localTs = await db.getTimestamp(key);
-            // Only invalidate if server timestamp is NEWER than local
-            return !localTs || localTs < value;
         }
     }
 });
+
+//wrap it inside the provider of your app
+ <ProCacheProvider client={cache}>
+        <App />
+    </ProCacheProvider>
 ```
 
 ### Key Config Options

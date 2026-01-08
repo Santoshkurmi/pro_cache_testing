@@ -16,7 +16,8 @@ pub struct RegisterTokenRequest {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct InvalidateRequest {
     pub project_id: String,
-    pub path: String,
+    pub path: Option<serde_json::Value>, // Accepts String or Number
+    pub paths: Option<Vec<serde_json::Value>>, // Accepts Array of Strings or Numbers
     pub user_id: Option<String>,
 }
 
@@ -47,6 +48,12 @@ pub struct AppState {
     // Global set of known routes, persisted to routes.json
     pub known_routes: DashMap<String, ()>,
     
+    // Last global timestamp received to detect clock drift (parking_lot for better performance)
+    pub last_global_timestamp: parking_lot::Mutex<i64>,
+
+    // Last time a clock drift was detected (or server start time)
+    pub last_drift_timestamp: std::sync::atomic::AtomicI64,
+
     // Stable timestamp of when the server started
     pub server_start_time: i64,
 }
@@ -60,25 +67,38 @@ pub struct SessionData {
 impl AppState {
     pub fn new() -> self::AppState {
         let known_routes = DashMap::new();
+        let project_invalidation_state = DashMap::new();
+        let server_start_time = chrono::Utc::now().timestamp_millis();
         
         // Load routes from routes.json if exists
         if let Ok(content) = std::fs::read_to_string("routes.json") {
             if let Ok(routes) = serde_json::from_str::<Vec<String>>(&content) {
                 for r in routes {
-                    known_routes.insert(r, ());
+                    known_routes.insert(r.clone(), ());
+                    
+                    // The user wants these to be sent to frontend on restart with current timestamp
+                    // We don't know the projects yet, so we can't pre-populate project_invalidation_state
+                    // unless we assume a default project or just handle it in ws.rs when a project connects.
                 }
                 log::info!("Loaded {} routes from routes.json", known_routes.len());
             }
         }
 
-        AppState {
+        let state = AppState {
             pending_tokens: DashMap::new(),
             active_sessions: DashMap::new(),
             user_tokens: DashMap::new(),
-            project_invalidation_state: DashMap::new(),
+            project_invalidation_state,
             known_routes,
-            server_start_time: chrono::Utc::now().timestamp_millis(),
-        }
+            last_global_timestamp: parking_lot::Mutex::new(0),
+            last_drift_timestamp: std::sync::atomic::AtomicI64::new(server_start_time),
+            server_start_time,
+        };
+
+        // For first project ever or on restart, we can't pre-touch projects,
+        // so we'll do that in ws.rs when someone connects.
+        
+        state
     }
 
     pub fn save_routes(&self) {
